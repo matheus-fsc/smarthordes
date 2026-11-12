@@ -790,7 +790,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
             act(z, s, zl, tl, dist);
         }
         if (REC != null) REC.frame(horde, s -> new Object[]{s.role, s.invTotal, s.gathering ? 1 : 0, s.action});
-        if (horde.isEmpty() && task != null) { task.cancel(); task = null; stopRecording(); }
+        if (horde.isEmpty() && task != null) { task.cancel(); task = null; if (!KEEP_REC) stopRecording(); }
     }
 
     // ---------------------------------------------------------------- fase de coleta
@@ -1505,6 +1505,17 @@ final class SmartHorde implements org.bukkit.event.Listener {
         }
         s.breaking = null;
     }
+
+    /** Arena de demonstracao: a gravacao segue ate a arena mandar parar (o jogador-zumbi continua jogando). */
+    static boolean KEEP_REC;
+
+    void startDemoRecording(World w, Location center, int lowY) {
+        stopRecording();
+        try { REC = new WaveRecorder(plugin, w, center, "demo", lowY); } catch (Exception ex) { plugin.getLogger().warning("gravador: " + ex); }
+        KEEP_REC = true;
+    }
+
+    void stopDemoRecording() { KEEP_REC = false; stopRecording(); }
 
     private static void stopRecording() {
         if (REC != null) { REC.close(); REC = null; }

@@ -81,6 +81,9 @@ final class Arena implements Listener {
         final List<double[]> path = new ArrayList<>(); // t(ms), x, y, z (ja no slot)
         final List<UUID> zombies = new ArrayList<>();
         int startTick, maxTicks, lastHurt = -9999, hits, built, broke, swings, firstHit = -1, pathIdx, turretsLeft;
+        /** Rodada de demonstracao (tag "demo..."): o alvo nao morre e a gravacao cobre tudo; solo = sem horda da IA. */
+        boolean demo, solo;
+        Location spawn;
         double dmg, minDist = 1e9;
     }
 
@@ -137,10 +140,13 @@ final class Arena implements Listener {
                     boolean hasParams = false;
                     for (int i = 1; i < args.length; i++) { if (args[i].indexOf('=') > 0) hasParams = true; else pos.add(args[i]); }
                     if (hasParams) setParams(args, 1);
+                    for (org.bukkit.entity.Monster m : world.getEntitiesByClass(org.bukkit.entity.Monster.class))
+                        if (!horde.isHorde(m)) m.remove();
                     String wave = pos.get(0);
                     String strat = pos.size() > 1 ? pos.get(1) : "replay";
                     int secs = pos.size() > 2 ? Integer.parseInt(pos.get(2)) : 300;
                     String tg = pos.size() > 3 ? pos.get(3) : "-";
+                    boolean solo = pos.size() > 4 && pos.get(4).equalsIgnoreCase("solo");
                     int slot = -1;
                     for (int s = 0; s < slots; s++) if (!rounds.containsKey(s) && !pasting.contains(s)) { slot = s; break; }
                     if (slot < 0) { plugin.getLogger().warning("ARENA_ERROR ocupado " + tg); return; }
@@ -148,7 +154,7 @@ final class Arena implements Listener {
                     pasting.add(sl);
                     paste(wave, sl, () -> {
                         pasting.remove(sl);
-                        try { start(wave, sl, strat, secs, tg); }
+                        try { start(wave, sl, strat, secs, tg, solo); }
                         catch (Exception ex) { plugin.getLogger().warning("ARENA_ERROR " + tg + " " + ex); }
                     });
                 }
@@ -233,7 +239,7 @@ final class Arena implements Listener {
     }
 
     // ------------------------------------------------------------------ rodada
-    private void start(String name, int slot, String strat, int secs, String tg) throws Exception {
+    private void start(String name, int slot, String strat, int secs, String tg, boolean solo) throws Exception {
         File dir = waveDir(name);
         JsonObject meta = JsonParser.parseString(Files.readString(new File(dir, "meta.json").toPath())).getAsJsonObject();
         JsonArray o = meta.getAsJsonArray("origin");
@@ -300,7 +306,16 @@ final class Arena implements Listener {
             r.turrets.add(tb);
         }
         r.startTick = Bukkit.getCurrentTick(); r.maxTicks = secs * 20;
-        r.zombies.addAll(horde.spawnExact(world, spots, roles, r.dummy));
+        r.demo = tg.startsWith("demo");
+        r.solo = solo;
+        r.spawn = spots.get(0).clone();
+        if (!solo) r.zombies.addAll(horde.spawnExact(world, spots, roles, r.dummy));
+        if (r.demo) {
+            int low = (int) r.dummy.getLocation().getY();
+            for (Location l : spots) low = Math.min(low, l.getBlockY());
+            horde.startDemoRecording(world, r.dummy.getLocation(), low);
+            if (!watch) { watch = true; if (sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint stop"); sprinting = false; } }
+        }
         rounds.put(slot, r);
         byDummy.put(r.dummy.getUniqueId(), r);
         if (!watch && !sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint 20000000"); sprinting = true; }
@@ -316,6 +331,10 @@ final class Arena implements Listener {
             if (task != null) { task.cancel(); task = null; }
         }
         if (!Bukkit.getOnlinePlayers().isEmpty() && Bukkit.getCurrentTick() % 10 == 0) labels();
+        if (Bukkit.getCurrentTick() % 100 == 0) {
+            for (org.bukkit.entity.Monster m : world.getEntitiesByClass(org.bukkit.entity.Monster.class))
+                if (!horde.isHorde(m)) m.remove(); // restos de rodadas antigas (versao anterior) e qualquer monstro solto
+        }
     }
 
     private void tickRound(Round r) {
@@ -333,7 +352,7 @@ final class Arena implements Listener {
             default -> { }
         }
         if (t % 10 == 0) { Zombie nz = nearest(r, 64); if (nz != null) r.minDist = Math.min(r.minDist, nz.getLocation().distance(r.dummy.getLocation())); }
-        if (hp(id) <= 0) { finish(r, "morreu"); return; }
+        if (hp(id) <= 0 && !r.demo) { finish(r, "morreu"); return; }
         if (t >= r.maxTicks) { finish(r, "tempo"); return; }
         if (t % 20 == 0 && horde.statsFor(r.zombies)[0] == 0) finish(r, "horda morta");
     }
@@ -432,6 +451,7 @@ final class Arena implements Listener {
         if (!(by.getDamager() instanceof Zombie) && !human) return;
         double d = e.getDamage() * (1 - ARMOR);
         HP.merge(r.dummy.getUniqueId(), -d, Double::sum);
+        if (r.demo && hp(r.dummy.getUniqueId()) < 1) HP.put(r.dummy.getUniqueId(), 1.0); // demo: o alvo aguenta (golpes contam)
         r.dmg += d;
         r.hits++;
         r.lastHurt = Bukkit.getCurrentTick() - r.startTick;
@@ -466,7 +486,8 @@ final class Arena implements Listener {
         if (r == null) { p.sendMessage("Nenhuma rodada rodando. Comece uma com /arena run <onda> replay 600 demo"); return; }
         Location at = null;
         for (UUID id : r.zombies) { Entity e = Bukkit.getEntity(id); if (e != null && !e.isDead()) { at = e.getLocation(); break; } }
-        if (at == null) at = r.dummy.getLocation().add(15, 0, 0);
+        if (at == null) at = r.spawn != null ? r.spawn : r.dummy.getLocation().add(15, 0, 0);
+        if (!watch) { watch = true; if (sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint stop"); sprinting = false; } }
         humanZombies.put(p.getUniqueId(), role);
         SmartHorde.ALLY_PLAYERS.add(p.getUniqueId());
         p.getInventory().clear();
@@ -553,6 +574,7 @@ final class Arena implements Listener {
         if (rounds.get(r.slot) != r) return;
         rounds.remove(r.slot);
         for (org.bukkit.entity.IronGolem g : r.golems) if (g.isValid()) g.remove();
+        if (r.demo) horde.stopDemoRecording();
         int turretsLeft = 0;
         for (Block tb : r.turrets) { if (tb.getType() == Material.DISPENSER) { turretsLeft++; tb.setType(Material.AIR); } }
         r.turretsLeft = turretsLeft;
