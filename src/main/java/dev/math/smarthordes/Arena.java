@@ -11,6 +11,7 @@ import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.WorldCreator;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Villager;
@@ -73,9 +74,13 @@ final class Arena implements Listener {
         int slot;
         Villager dummy;
         String strategy, tag, wave;
+        /** Estrategia base do boneco ("replay", "pillar"...) e defesas da rodada: "replay+g2+t3" = 2 golens e 3 torres. */
+        String base;
+        final List<org.bukkit.entity.IronGolem> golems = new ArrayList<>();
+        final List<Block> turrets = new ArrayList<>();
         final List<double[]> path = new ArrayList<>(); // t(ms), x, y, z (ja no slot)
         final List<UUID> zombies = new ArrayList<>();
-        int startTick, maxTicks, lastHurt = -9999, hits, built, broke, swings, firstHit = -1, pathIdx;
+        int startTick, maxTicks, lastHurt = -9999, hits, built, broke, swings, firstHit = -1, pathIdx, turretsLeft;
         double dmg, minDist = 1e9;
     }
 
@@ -270,6 +275,29 @@ final class Arena implements Listener {
         SmartHorde.EXTRA_TARGETS.add(r.dummy.getUniqueId());
         HP.put(r.dummy.getUniqueId(), 20.0);
         r.strategy = strat; r.tag = tg; r.wave = name;
+        String[] mods = strat.split("\\+");
+        r.base = mods[0];
+        int golems = 0, turrets = 0;
+        for (int k = 1; k < mods.length; k++) {
+            try {
+                if (mods[k].startsWith("g")) golems = Integer.parseInt(mods[k].substring(1));
+                if (mods[k].startsWith("t")) turrets = Integer.parseInt(mods[k].substring(1));
+            } catch (NumberFormatException ignored) { }
+        }
+        Location home = r.dummy.getLocation();
+        for (int k = 0; k < golems; k++) {
+            double a = Math.PI * 2 * k / Math.max(1, golems);
+            Location gl = home.clone().add(Math.cos(a) * 2.5, 0, Math.sin(a) * 2.5);
+            gl.setY(world.getHighestBlockYAt(gl) + 1);
+            r.golems.add(world.spawn(gl, org.bukkit.entity.IronGolem.class, g -> { g.setPlayerCreated(true); g.setPersistent(true); }));
+        }
+        for (int k = 0; k < turrets; k++) {
+            double a = Math.PI * 2 * k / Math.max(1, turrets) + 0.4;
+            Block tb = world.getBlockAt((int) Math.floor(home.getX() + Math.cos(a) * 4), 0, (int) Math.floor(home.getZ() + Math.sin(a) * 4));
+            tb = world.getHighestBlockAt(tb.getLocation()).getRelative(BlockFace.UP);
+            tb.setType(Material.DISPENSER);
+            r.turrets.add(tb);
+        }
         r.startTick = Bukkit.getCurrentTick(); r.maxTicks = secs * 20;
         r.zombies.addAll(horde.spawnExact(world, spots, roles, r.dummy));
         rounds.put(slot, r);
@@ -295,7 +323,8 @@ final class Arena implements Listener {
         UUID id = r.dummy.getUniqueId();
         double hp = hp(id);
         if (hp < 20 && t - r.lastHurt > 80 && t % 80 == 0) HP.put(id, Math.min(20, hp + 1)); // regeneracao natural
-        switch (r.strategy) {
+        if (!r.turrets.isEmpty() && t % 20 == 0) turretShots(r);
+        switch (r.base == null ? r.strategy : r.base) {
             case "replay" -> replay(r, t);
             case "pillar" -> { pillar(r, t); breakStruct(r, t); }
             case "fighter" -> fight(r, t);
@@ -411,9 +440,41 @@ final class Arena implements Listener {
         if (byDummy.containsKey(e.getEntity().getUniqueId())) e.setCancelled(true);
     }
 
+    /**
+     * Torre da arena com os numeros da Torre Sentinela do Classforge (nivel 1): 1 tiro/s, alcance 12, so em
+     * mobs da horda com linha de visao. A flecha leva a marca de origem, como a torre de verdade.
+     */
+    private void turretShots(Round r) {
+        for (Block tb : r.turrets) {
+            if (tb.getType() != Material.DISPENSER) continue;
+            Location muzzle = tb.getLocation().add(0.5, 1.2, 0.5);
+            org.bukkit.entity.LivingEntity best = null;
+            double bd = 144;
+            for (UUID id : r.zombies) {
+                Entity e = Bukkit.getEntity(id);
+                if (!(e instanceof org.bukkit.entity.LivingEntity le) || le.isDead()) continue;
+                double d = le.getLocation().distanceSquared(muzzle);
+                if (d >= bd) continue;
+                org.bukkit.util.Vector to = le.getEyeLocation().toVector().subtract(muzzle.toVector());
+                if (world.rayTraceBlocks(muzzle, to.clone().normalize(), Math.max(0.1, to.length() - 0.6)) != null) continue; // sem visao
+                bd = d; best = le;
+            }
+            if (best == null) continue;
+            org.bukkit.util.Vector dir = best.getEyeLocation().toVector().subtract(muzzle.toVector()).normalize();
+            org.bukkit.entity.Arrow ar = world.spawnArrow(muzzle, dir, 2.6f, 2f);
+            ar.setPickupStatus(org.bukkit.entity.AbstractArrow.PickupStatus.DISALLOWED);
+            ar.getPersistentDataContainer().set(SmartHorde.TURRET_ORIGIN, org.bukkit.persistence.PersistentDataType.STRING,
+                    tb.getX() + "," + tb.getY() + "," + tb.getZ());
+        }
+    }
+
     private void finish(Round r, String why) {
         if (rounds.get(r.slot) != r) return;
         rounds.remove(r.slot);
+        for (org.bukkit.entity.IronGolem g : r.golems) if (g.isValid()) g.remove();
+        int turretsLeft = 0;
+        for (Block tb : r.turrets) { if (tb.getType() == Material.DISPENSER) { turretsLeft++; tb.setType(Material.AIR); } }
+        r.turretsLeft = turretsLeft;
         int t = Bukkit.getCurrentTick() - r.startTick;
         int[] st = horde.statsFor(r.zombies);
         horde.removeAll(r.zombies);

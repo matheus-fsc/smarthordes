@@ -58,6 +58,10 @@ final class SmartHorde implements org.bukkit.event.Listener {
         int tick;
         /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
         Location swimTo;
+        /** Golem que bateu nele (guerreiro revida por alguns segundos) e torre que ele foi quebrar. */
+        UUID golem;
+        long golemUntil;
+        Block hunting;
         /** Ultimo bloco que este zumbi quebrou: a coleta continua colada nele (um buraco so, nao furos espalhados). */
         Block lastMined;
         /** Horda de caverna: so mineradores, que cavam qualquer bloco natural da caverna (e so eles). */
@@ -159,6 +163,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.ramp-repair", true);
         plugin.getConfig().addDefault("horde.ramp-pioneer", true);
         plugin.getConfig().addDefault("horde.ramp-widen", true);
+        plugin.getConfig().addDefault("horde.fight-golems", true);
+        plugin.getConfig().addDefault("horde.break-turrets", true);
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
         plugin.getConfig().addDefault("horde.drowned", true);
@@ -675,6 +681,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
             s.swimTo = null;
             s.waterTicks = 0;
             if (t == null) continue;
+            if (defenseTick(z, s, now())) { debug(z, s, z.getLocation().distance(t.getLocation()), 0); continue; }
             // ALVO SE DEFENDE COM AGUA (nadando, de barco, ilha ou fosso): parte da horda mergulha de proposito
             // para virar afogado; os construtores seguem tentando ponte/rampa
             if (opt("drowned") && !(z instanceof org.bukkit.entity.Drowned) && !(z instanceof org.bukkit.entity.PigZombie)
@@ -1136,7 +1143,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
      * (pedra sim; ferro/diamante/obsidiana nao); lenhador so blocos de madeira (tag de machado).
      */
     /** Blocos que a horda colocou (rampa, pilar, degrau, ponte, escada): ninguem da horda desmonta. */
-    static final java.util.Set<Block> ZPLACED = new java.util.HashSet<>();
+    static final java.util.Set<Block> ZPLACED = new java.util.LinkedHashSet<>();
 
     /**
      * Blocos NATURAIS de caverna. No subsolo o minerador so cava estes: abre tunel ate o jogador,
@@ -1478,7 +1485,10 @@ final class SmartHorde implements org.bukkit.event.Listener {
     }
 
     private static void placeFx(Block b) {
-        if (ZPLACED.size() > 20000) ZPLACED.clear();
+        if (ZPLACED.size() > 20000) { // tira so os 5000 mais antigos (estruturas velhas), nunca a obra atual
+            var it = ZPLACED.iterator();
+            for (int k = 0; k < 5000 && it.hasNext(); k++) { it.next(); it.remove(); }
+        }
         ZPLACED.add(b);
         if (REC != null) REC.block(b, b.getType());
         b.getWorld().playSound(b.getLocation(), Sound.BLOCK_STONE_PLACE, 1f, 0.9f);
@@ -1799,6 +1809,77 @@ final class SmartHorde implements org.bukkit.event.Listener {
      * inventario) e marca a rampa para replanejar: o plano novo reaproveita a parte de baixo (extend).
      * Devolve o que fez, ou null se nao ha o que consertar.
      */
+    // ---------------------------------------------------------------- defesas (golens e torres)
+
+    /** Marca de origem das flechas de torre (Classforge e a torre da arena): "x,y,z" do bloco da torre. */
+    static final NamespacedKey TURRET_ORIGIN = new NamespacedKey("hardcorerouletteclasses", "turret-origin");
+    /** Torres que atiraram na horda recentemente: bloco -> ultimo tiro (ms). */
+    static final Map<Block, Long> TURRETS = new HashMap<>();
+
+    /** Zumbi da horda apanhou: de golem (lembra quem) ou de flecha de torre (lembra onde a torre esta). */
+    @org.bukkit.event.EventHandler(ignoreCancelled = true)
+    public void onHordeHurt(org.bukkit.event.entity.EntityDamageByEntityEvent e) {
+        State s = horde.get(e.getEntity().getUniqueId());
+        if (s == null) return;
+        if (e.getDamager() instanceof org.bukkit.entity.IronGolem g) {
+            s.golem = g.getUniqueId();
+            s.golemUntil = now() + (long) P("golem_fight_ms", 6000);
+        } else if (e.getDamager() instanceof org.bukkit.entity.Projectile pr) {
+            String o = pr.getPersistentDataContainer().get(TURRET_ORIGIN, PersistentDataType.STRING);
+            if (o == null) return;
+            String[] xyz = o.split(",");
+            try {
+                Block b = pr.getWorld().getBlockAt(Integer.parseInt(xyz[0]), Integer.parseInt(xyz[1]), Integer.parseInt(xyz[2]));
+                TURRETS.put(b, now());
+            } catch (RuntimeException ignored) { }
+        }
+    }
+
+    /**
+     * Guerreiros revidam o golem que bateu neles; construtores com picareta vao quebrar a torre que esta
+     * atirando na horda (no maximo turret_hunters por torre). true = ocupado com isso neste tick.
+     */
+    private boolean defenseTick(Zombie z, State s, long now) {
+        if (tool(s) == null && opt("fight-golems") && s.golem != null && now < s.golemUntil) {
+            Entity g = Bukkit.getEntity(s.golem);
+            if (g instanceof org.bukkit.entity.IronGolem ig && !ig.isDead() && ig.getWorld() == z.getWorld()
+                    && ig.getLocation().distanceSquared(z.getLocation()) < 144) {
+                if (z.getTarget() != ig) z.setTarget(ig);
+                s.action = "lutando com golem";
+                return true;
+            }
+            s.golem = null;
+        }
+        if (!opt("break-turrets") || (s.role != MINER && s.role != DIGGER) || s.rampMode) return false;
+        TURRETS.entrySet().removeIf(en -> now - en.getValue() > 30_000 || en.getKey().getType() != Material.DISPENSER);
+        if (s.hunting != null && !TURRETS.containsKey(s.hunting)) s.hunting = null;
+        if (s.hunting == null) {
+            double r2 = P("turret_hunt_r", 20) * P("turret_hunt_r", 20), bd = r2;
+            for (Block b : TURRETS.keySet()) {
+                if (b.getWorld() != z.getWorld()) continue;
+                double d = b.getLocation().add(0.5, 0.5, 0.5).distanceSquared(z.getLocation());
+                if (d >= bd) continue;
+                int hunters = 0;
+                for (State o : horde.values()) if (b.equals(o.hunting)) hunters++;
+                if (hunters >= Pi("turret_hunters", 2)) continue;
+                bd = d; s.hunting = b;
+            }
+        }
+        if (s.hunting == null) return false;
+        Block b = s.hunting;
+        Location c = b.getLocation().add(0.5, 0.5, 0.5);
+        if (z.getLocation().distance(c) <= 3.5) {
+            if (z.getTarget() != null) z.setTarget(null);
+            progressBreak(z, s, b);
+            s.action = "quebrando torre";
+            if (b.getType() != Material.DISPENSER) { TURRETS.remove(b); s.hunting = null; }
+        } else {
+            z.getPathfinder().moveTo(c, 1.2);
+            s.action = "indo quebrar torre";
+        }
+        return true;
+    }
+
     private final Map<UUID, UUID> pioneers = new HashMap<>();
 
     /** Um pioneiro por alvo: o construtor (com ferramenta) que tiver mais blocos; troca se ele morrer ou mudar de alvo. */
@@ -1906,6 +1987,10 @@ final class SmartHorde implements org.bukkit.event.Listener {
         }
         if (r.fixStage == 1) {
             r.fixStage = 2;
+            if (hordeAbove(r, i)) { // tem zumbi la em cima: desmontar deixaria ele ilhado e ele cairia
+                r.broken = true;
+                return "rampa: replaneja sem desmontar (tem horda em cima)";
+            }
             int removed = 0;
             for (int j = r.steps.size() - 1; j > i; j--) {
                 Block st = r.steps.get(j);
@@ -1915,6 +2000,20 @@ final class SmartHorde implements org.bukkit.event.Listener {
             if (removed > 0) return "rampa: desmontou " + removed + " degraus de cima, refaz dali";
         }
         return null;
+    }
+
+    /** Algum zumbi da horda em pe nos degraus acima de i (ou a ate 2 blocos deles)? */
+    private boolean hordeAbove(Ramp r, int i) {
+        for (UUID id : horde.keySet()) {
+            Entity e = Bukkit.getEntity(id);
+            if (e == null || e.isDead()) continue;
+            Location l = e.getLocation();
+            for (int j = i + 1; j < r.steps.size(); j++) {
+                Block st = r.steps.get(j);
+                if (st.getWorld() == l.getWorld() && st.getLocation().add(0.5, 1, 0.5).distanceSquared(l) <= 4) return true;
+            }
+        }
+        return false;
     }
 
     /** Recolhe um bloco que a propria horda colocou (volta pro inventario de quem recolheu). */
