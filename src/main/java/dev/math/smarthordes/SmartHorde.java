@@ -58,6 +58,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         int tick;
         /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
         Location swimTo;
+        /** Ultimo bloco que este zumbi quebrou: a coleta continua colada nele (um buraco so, nao furos espalhados). */
+        Block lastMined;
         /** Horda de caverna: so mineradores, que cavam qualquer bloco natural da caverna (e so eles). */
         boolean cave;
         /** Ticks seguidos na agua e se ja sorteou virar afogado nesta vida. */
@@ -154,6 +156,9 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.emerge", true);
         plugin.getConfig().addDefault("horde.swim", true);
         plugin.getConfig().addDefault("horde.cave-miners", true);
+        plugin.getConfig().addDefault("horde.ramp-repair", true);
+        plugin.getConfig().addDefault("horde.fell-whole-tree", true);
+        plugin.getConfig().addDefault("horde.tidy-gather", true);
         plugin.getConfig().addDefault("horde.drowned", true);
         plugin.getConfig().addDefault("horde.no-self-push", true);
         plugin.getConfig().addDefault("horde.ramp-wide-floating", true);
@@ -879,6 +884,15 @@ final class SmartHorde implements org.bukkit.event.Listener {
             for (ItemStack d : drops(s, b)) if (buildable(d.getType()) || Tag.LOGS.isTagged(d.getType())) { useful = true; break; }
             if (!useful) continue; // ex.: minerio de carvao nao serve
             double score = Math.sqrt(dx * dx + dz * dz + dyb * dyb * 1.5) + m.getHardness() * 1.5;
+            if (opt("tidy-gather") && s.role != LUMBER) {
+                // escava organizado: continua no buraco que ja abriu (vizinho do ultimo bloco) e de cima para baixo
+                Block lm = s.lastMined;
+                if (lm != null && lm.getWorld() == b.getWorld()) {
+                    int md = Math.abs(lm.getX() - b.getX()) + Math.abs(lm.getY() - b.getY()) + Math.abs(lm.getZ() - b.getZ());
+                    if (md <= 2) score -= P("tidy_bonus", 6) - md;
+                }
+                score -= dyb * 0.4; // mais alto primeiro: tira a camada de cima antes de afundar
+            }
             if (score < bestScore) { bestScore = score; best = b; }
         }
         return best;
@@ -1142,7 +1156,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         if (ZPLACED.contains(b)) return false; // nao desmonta a propria estrutura (derrubava quem estava em cima)
         // CAVERNA: so blocos naturais (a base do jogador no subsolo fica segura)
         if (s.cave) return CAVE_BLOCKS.contains(m);
-        if (Tag.LEAVES.isTagged(m) && s.role != BRUTE && s.role != TANK) return true; // folha sai na mao (vanilla): travava a rampa
+        if (Tag.LEAVES.isTagged(m)) return true; // folha sai na mao (vanilla), qualquer papel: travava rampa e guerreiros
         return switch (s.role) {
             case MINER -> Tag.MINEABLE_PICKAXE.isTagged(m) && !Tag.NEEDS_STONE_TOOL.isTagged(m)
                     && !Tag.NEEDS_IRON_TOOL.isTagged(m) && !Tag.NEEDS_DIAMOND_TOOL.isTagged(m);
@@ -1167,9 +1181,38 @@ final class SmartHorde implements org.bukkit.event.Listener {
         if (progress >= 1f) {
             b.getWorld().playSound(b.getLocation(), Sound.ENTITY_ZOMBIE_BREAK_WOODEN_DOOR, 0.8f, 1f);
             cancelBreak(z, s);
+            boolean log = Tag.LOGS.isTagged(b.getType());
             collect(s, b);
+            s.lastMined = b;
+            if (log && s.role == LUMBER && opt("fell-whole-tree")) fellTree(s, b);
             s.stuckTicks = 0;
         }
+    }
+
+    /**
+     * Lenhador: derruba a arvore inteira a partir do tronco quebrado (troncos ligados, ate 64).
+     * Nao deixa toco flutuando nem tronco furado; as folhas caem sozinhas (vanilla). O que nao cabe no
+     * inventario cai no chao. Nao mexe em madeira que nao seja tronco (casas de tabua ficam intactas).
+     */
+    private void fellTree(State s, Block start) {
+        java.util.ArrayDeque<Block> q = new java.util.ArrayDeque<>();
+        java.util.Set<Block> seen = new java.util.HashSet<>();
+        for (int dx = -1; dx <= 1; dx++) for (int dy = 0; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+            Block n = start.getRelative(dx, dy, dz);
+            if (Tag.LOGS.isTagged(n.getType()) && seen.add(n)) q.add(n);
+        }
+        int felled = 0;
+        while (!q.isEmpty() && felled < 64) {
+            Block b = q.poll();
+            if (!Tag.LOGS.isTagged(b.getType()) || ZPLACED.contains(b)) continue;
+            collect(s, b);
+            felled++;
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                Block n = b.getRelative(dx, dy, dz);
+                if (Tag.LOGS.isTagged(n.getType()) && seen.add(n)) q.add(n);
+            }
+        }
+        if (felled > 0) start.getWorld().playSound(start.getLocation(), Sound.BLOCK_WOOD_BREAK, 1f, 0.7f);
     }
 
     /** Quebra o bloco e guarda o drop no inventario (como se fosse com picareta); o que nao cabe cai no chao. */
@@ -1470,6 +1513,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
     private static final class Ramp {
         final Block player; final List<Block> steps; final Block entry; final Block waitCenter; final String desc;
         boolean broken;
+        /** Conserto em andamento: 1 = curva desobstruida/apoio colocado no degrau fixIndex; 2 = desmontou dali pra cima. */
+        int fixStage, fixIndex = -1;
         UUID worker; // 1 construtor por vez na rampa (1 de largura: mais de um empurra e cai)
         UUID carrier; long carrierSince; // quem esta levando blocos ate o construtor
         long workerEmptySince;
@@ -1740,6 +1785,76 @@ final class SmartHorde implements org.bukkit.event.Listener {
         return false;
     }
 
+    /**
+     * Zumbi travado numa rampa pronta (tipico na curva: a cabeca bate no degrau de cima ou nao ha onde virar).
+     * 1a vez naquele degrau: tira blocos da horda acima da cabeca e coloca um degrau de apoio no canto da curva.
+     * 2a vez no mesmo degrau: desmonta os degraus de cima (so blocos da horda, sem ninguem em cima; voltam pro
+     * inventario) e marca a rampa para replanejar: o plano novo reaproveita a parte de baixo (extend).
+     * Devolve o que fez, ou null se nao ha o que consertar.
+     */
+    private String repairRamp(Zombie z, State s, Ramp r) {
+        Block under = z.getLocation().getBlock().getRelative(BlockFace.DOWN);
+        int i = r.steps.indexOf(under);
+        if (i < 0) { // nao esta exatamente num degrau: o mais proximo a ate 2 blocos
+            double bd = 4.0;
+            for (int k = 0; k < r.steps.size(); k++) {
+                double d = r.steps.get(k).getLocation().add(0.5, 1, 0.5).distanceSquared(z.getLocation());
+                if (d < bd) { bd = d; i = k; }
+            }
+        }
+        if (i < 0 || i >= r.steps.size() - 1) return null;
+        if (r.fixIndex != i) { r.fixIndex = i; r.fixStage = 0; }
+        if (r.fixStage == 0) {
+            r.fixStage = 1;
+            int done = 0;
+            // teto: bloco da horda logo acima da cabeca de quem vai pular para o proximo degrau
+            Block feet = r.steps.get(i).getRelative(BlockFace.UP);
+            for (Block c : new Block[]{feet.getRelative(0, 2, 0), r.steps.get(i + 1).getRelative(0, 3, 0)}) {
+                if (ZPLACED.contains(c) && !r.steps.subList(0, i + 2).contains(c) && !occupied(c.getRelative(BlockFace.UP), z)) {
+                    takeOwn(s, c);
+                    done++;
+                }
+            }
+            // apoio na curva: continua um bloco na direcao que vinha, para ter onde virar
+            if (i > 0) {
+                Block a = r.steps.get(i), prev = r.steps.get(i - 1), next = r.steps.get(i + 1);
+                int pdx = a.getX() - prev.getX(), pdz = a.getZ() - prev.getZ();
+                int ndx = next.getX() - a.getX(), ndz = next.getZ() - a.getZ();
+                if ((pdx != ndx || pdz != ndz) && s.invTotal > 0) {
+                    Block pad = a.getRelative(Integer.signum(pdx), 0, Integer.signum(pdz));
+                    if (pad.isPassable() && !pad.isLiquid() && pad.getRelative(BlockFace.UP).isPassable()
+                            && pad.getRelative(0, 2, 0).isPassable() && !r.steps.contains(pad) && !occupied(pad, z)) {
+                        pad.setType(takeBlock(s));
+                        placeFx(pad);
+                        done++;
+                    }
+                }
+            }
+            if (done > 0) return "rampa: consertando a curva (" + done + " blocos)";
+        }
+        if (r.fixStage == 1) {
+            r.fixStage = 2;
+            int removed = 0;
+            for (int j = r.steps.size() - 1; j > i; j--) {
+                Block st = r.steps.get(j);
+                if (ZPLACED.contains(st) && !occupied(st.getRelative(BlockFace.UP), z)) { takeOwn(s, st); removed++; }
+            }
+            r.broken = true;
+            if (removed > 0) return "rampa: desmontou " + removed + " degraus de cima, refaz dali";
+        }
+        return null;
+    }
+
+    /** Recolhe um bloco que a propria horda colocou (volta pro inventario de quem recolheu). */
+    private void takeOwn(State s, Block b) {
+        Material m = b.getType();
+        b.setType(Material.AIR);
+        ZPLACED.remove(b);
+        if (REC != null) REC.block(b, Material.AIR);
+        addBlock(s, m);
+        b.getWorld().playSound(b.getLocation(), Sound.BLOCK_STONE_BREAK, 0.8f, 1.1f);
+    }
+
     /** Um zumbi da horda trabalha na rampa: abre a cabeca do degrau, vai ate o degrau de baixo e coloca o proximo. */
     private boolean rampTick(Zombie z, State s, LivingEntity t, long now) {
         Ramp r = rampFor(t);
@@ -1749,7 +1864,16 @@ final class SmartHorde implements org.bukkit.event.Listener {
             Location here = z.getLocation();
             if (s.lastPos != null && here.distanceSquared(s.lastPos) < 0.05) s.rampStuck++; else s.rampStuck = 0;
             s.lastPos = here.clone();
-            if (s.rampStuck > 20) { r.broken = true; s.rampStuck = 0; return rampWhy(z, s, "pronta mas nao chega: replaneja (" + r.desc + ")"); }
+            if (s.rampStuck > 20) {
+                s.rampStuck = 0;
+                // antes de jogar a rampa fora: conserta a curva ou desmonta so o trecho de cima e refaz dali
+                if (opt("ramp-repair")) {
+                    String fix = repairRamp(z, s, r);
+                    if (fix != null) return rampWhy(z, s, fix + " (" + r.desc + ")");
+                }
+                r.broken = true;
+                return rampWhy(z, s, "pronta mas nao chega: replaneja (" + r.desc + ")");
+            }
             return rampWhy(z, s, "pronta (" + r.desc + ")");
         }
         Block step = r.steps.get(d), stand = r.stand(d);

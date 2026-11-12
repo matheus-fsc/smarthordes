@@ -48,11 +48,14 @@ horde:
     diver_share_builders: 0.2  # construtores que mergulham (o resto tenta ponte/rampa)
   surround: true
   ramp: true
+  ramp-repair: true         # rampa travada na curva: conserta o canto ou desmonta o trecho de cima e refaz
   ramp-shapes: "straight,zigzag,spiral"
   ramp-wide-floating: true
   dig-stairs: true
   escape-ceiling: true
   warrior-escort: true
+  fell-whole-tree: true     # lenhador derruba a arvore inteira (sem toco flutuando)
+  tidy-gather: true         # coleta organizada: um buraco so, de cima para baixo, sem furos espalhados
   log-to-planks: true
   no-self-push: true
   block-capacity: 32
