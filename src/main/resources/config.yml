@@ -1,0 +1,51 @@
+# SmartHordes: configuracao
+#
+# Valores abaixo sao os padroes. Chave que faltar e adicionada sozinha quando o servidor liga.
+# Atualizando do HardcoreRoulette 1.3 ou anterior: na primeira vez o plugin copia as secoes
+# invasion, nether-horde e horde do config.yml dele.
+
+# Log detalhado em plugins/SmartHordes/logs (ligue so para investigar um problema).
+# /horda report gera um relatorio para anexar num issue.
+debug: false
+
+# Mundo das hordas quando o HardcoreRoulette nao esta instalado (vazio = mundo principal).
+# Com o HardcoreRoulette, a horda sempre vai para o mundo da run atual.
+world: ""
+
+# Servidor de teste: liga so a arena (/arena) e desliga a horda normal.
+arena-mode: false
+
+# Horda noturna de zumbis (avisada a tarde, nasce as 13000 ticks).
+invasion:
+  enabled: true
+  min-day: 1
+  max-zombies: 24
+  rest-nights: 1            # noites sem horda depois de uma horda
+  chance:
+    zumbis: 0.25
+  ramp:
+    chance-per-hour: 0.06   # a chance sobe com as horas de jogo da run...
+    max-chance: 0.55        # ...ate este teto
+    size-per-hour: 2
+    days-per-zombie: 4
+
+# Zumbis-porco que seguem quem fica muito tempo no Nether.
+nether-horde:
+  enabled: true
+  max-minutes: 10
+
+# IA da horda (cavar, rampas, cercar). Desligue o que pesar no servidor.
+horde:
+  emerge: true              # mobs saem de dentro da terra com animacao
+  surround: true
+  ramp: true
+  ramp-shapes: "straight,zigzag,spiral"
+  ramp-wide-floating: true
+  dig-stairs: true
+  escape-ceiling: true
+  warrior-escort: true
+  log-to-planks: true
+  no-self-push: true
+  block-capacity: 32
+  record: true
+  debug: false

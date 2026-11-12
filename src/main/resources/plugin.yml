@@ -1,0 +1,22 @@
+name: SmartHordes
+version: 1.0.0
+main: dev.math.smarthordes.SmartHordes
+api-version: "26.3"
+author: matheus-fsc
+website: https://github.com/matheus-fsc/smarthordes
+description: Hordas de zumbis que cavam, constroem e cercam, avisadas a tarde. Integra com o HardcoreRoulette.
+softdepend: [HardcoreRoulette]
+commands:
+  horda:
+    description: Hordas (status, iniciar, parar, nether, report)
+    usage: /horda <status|zumbis|nether|parar|report> [qtd] [alvo] [construtores]
+    aliases: [invasao, smarthordes]
+    permission: smarthordes.admin
+  arena:
+    description: Arena de teste da horda (so com arena-mode)
+    usage: /arena load|run|stop
+    permission: smarthordes.admin
+permissions:
+  smarthordes.admin:
+    description: Comandos da horda
+    default: op

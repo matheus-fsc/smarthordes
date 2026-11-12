@@ -1,0 +1,432 @@
+package dev.math.smarthordes;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import org.bukkit.Bukkit;
+import org.bukkit.GameRule;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.World;
+import org.bukkit.WorldCreator;
+import org.bukkit.block.Block;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.Villager;
+import org.bukkit.entity.Zombie;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityTransformEvent;
+import org.bukkit.generator.ChunkGenerator;
+import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.Vector;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.zip.GZIPInputStream;
+
+/**
+ * Arena de teste (servidor separado com arena-mode: true): o proprio jogo como simulador.
+ * Varias rodadas ao mesmo tempo no mesmo servidor (arena-slots na config): cada uma num "slot" a 1000 blocos
+ * das outras, com o terreno de uma onda gravada, a horda no lugar/papel de onde comecou e um substituto do
+ * jogador (aldeao sem IA) seguindo o trajeto gravado ou uma estrategia. Roda acelerado com /tick sprint enquanto
+ * houver rodada; cada rodada imprime "ARENA_RESULT {json}" com a sua tag.
+ *
+ * /arena params k=v ...                        parametros da horda para as proximas rodadas (horde.p.k / opt:k)
+ * /arena run <onda> <estrategia> [seg] [tag]   estrategias: replay afk pillar fighter smart
+ * /arena stop | watch on|off
+ */
+final class Arena implements Listener {
+
+    static final Map<UUID, Double> HP = new HashMap<>();
+
+    static double hp(UUID id) { return HP.getOrDefault(id, 20.0); }
+
+    private static final double ARMOR = 0.4;
+    private static final int SLOT_SPACING = 1000;
+
+    private final SmartHordes plugin;
+    private final SmartHorde horde;
+    private final World world;
+    private final int slots;
+    private final Map<Integer, Round> rounds = new HashMap<>();
+    private final Map<UUID, Round> byDummy = new HashMap<>();
+    private final java.util.Set<Integer> pasting = new java.util.HashSet<>();
+    private final int[][] boxes; // ultima colagem por slot (x0 y0 z0 sx sy sz)
+    private BukkitTask task;
+    private boolean sprinting, watch;
+
+    /** Uma rodada (um slot). */
+    private final class Round {
+        int slot;
+        Villager dummy;
+        String strategy, tag, wave;
+        final List<double[]> path = new ArrayList<>(); // t(ms), x, y, z (ja no slot)
+        final List<UUID> zombies = new ArrayList<>();
+        int startTick, maxTicks, lastHurt = -9999, hits, built, broke, swings, firstHit = -1, pathIdx;
+        double dmg, minDist = 1e9;
+    }
+
+    Arena(SmartHordes plugin) {
+        this.plugin = plugin;
+        this.horde = new SmartHorde(plugin);
+        this.slots = Math.max(1, plugin.getConfig().getInt("arena-slots", 1));
+        this.boxes = new int[slots][];
+        Bukkit.getPluginManager().registerEvents(this, plugin);
+        World w = Bukkit.getWorld("arena");
+        if (w == null) w = new WorldCreator("arena").generator(new ChunkGenerator() { }).createWorld(); // vazio
+        world = w;
+        rule(false, "advance_time", "doDaylightCycle");
+        rule(false, "spawn_mobs", "doMobSpawning");
+        rule(false, "advance_weather", "doWeatherCycle");
+        rule(0, "random_tick_speed", "randomTickSpeed");
+        world.setDifficulty(org.bukkit.Difficulty.HARD); // mundo novo nasce pacifico: zumbi sumia na hora
+        world.setSpawnFlags(false, false);
+        world.setTime(6000);
+        world.setStorm(false);
+        plugin.getLogger().info("ARENA pronta (mundo 'arena', " + slots + " slots)");
+    }
+
+    /** Gamerule pelo nome (os nomes mudaram no 26.x: tenta os dois). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void rule(Object value, String... names) {
+        for (GameRule<?> g : GameRule.values()) {
+            for (String n : names) {
+                if (g.getName().equalsIgnoreCase(n) || g.getName().equalsIgnoreCase("minecraft:" + n)) {
+                    try { world.setGameRule((GameRule) g, value); } catch (Exception ignored) { }
+                    return;
+                }
+            }
+        }
+    }
+
+    private File waveDir(String name) {
+        File f = new File(name);
+        if (f.isDirectory()) return f;
+        return new File(plugin.getDataFolder(), "waves/" + name);
+    }
+
+    void command(CommandSender sender, String[] args) {
+        try {
+            if (args.length == 0) { sender.sendMessage("/arena params k=v .. | run <onda> <estrategia> [seg] [tag] | stop | watch on|off"); return; }
+            switch (args[0]) {
+                case "params" -> {
+                    setParams(args, 1);
+                    plugin.getLogger().info("ARENA_PARAMS_OK");
+                }
+                case "run" -> {
+                    // compat: tokens k=v no proprio run (1 slot) continuam funcionando
+                    List<String> pos = new ArrayList<>();
+                    boolean hasParams = false;
+                    for (int i = 1; i < args.length; i++) { if (args[i].indexOf('=') > 0) hasParams = true; else pos.add(args[i]); }
+                    if (hasParams) setParams(args, 1);
+                    String wave = pos.get(0);
+                    String strat = pos.size() > 1 ? pos.get(1) : "replay";
+                    int secs = pos.size() > 2 ? Integer.parseInt(pos.get(2)) : 300;
+                    String tg = pos.size() > 3 ? pos.get(3) : "-";
+                    int slot = -1;
+                    for (int s = 0; s < slots; s++) if (!rounds.containsKey(s) && !pasting.contains(s)) { slot = s; break; }
+                    if (slot < 0) { plugin.getLogger().warning("ARENA_ERROR ocupado " + tg); return; }
+                    final int sl = slot;
+                    pasting.add(sl);
+                    paste(wave, sl, () -> {
+                        pasting.remove(sl);
+                        try { start(wave, sl, strat, secs, tg); }
+                        catch (Exception ex) { plugin.getLogger().warning("ARENA_ERROR " + tg + " " + ex); }
+                    });
+                }
+                case "stop" -> { for (Round r : new ArrayList<>(rounds.values())) finish(r, "parado"); }
+                case "watch" -> {
+                    watch = args.length < 2 || args[1].equalsIgnoreCase("on");
+                    if (watch && sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint stop"); sprinting = false; }
+                    sender.sendMessage("modo assistir: " + (watch ? "velocidade normal" : "acelerado (tick sprint)"));
+                }
+                default -> sender.sendMessage("subcomando desconhecido");
+            }
+        } catch (Exception ex) {
+            plugin.getLogger().warning("ARENA_ERROR " + ex);
+        }
+    }
+
+    /** Parametros da horda so em memoria (horde.p.k ou opt:k = horde.k). Zera os anteriores. */
+    private void setParams(String[] args, int from) {
+        var cfg = plugin.getConfig();
+        for (String key : new ArrayList<>(cfg.getKeys(true))) if (key.startsWith("horde.p.")) cfg.set(key, null);
+        for (int i = from; i < args.length; i++) {
+            String tok = args[i];
+            int eq = tok.indexOf('=');
+            if (eq <= 0) continue;
+            String k = tok.substring(0, eq), v = tok.substring(eq + 1);
+            String path = k.startsWith("opt:") ? "horde." + k.substring(4) : "horde.p." + k;
+            if (v.equals("true") || v.equals("false")) cfg.set(path, Boolean.parseBoolean(v));
+            else try { cfg.set(path, Double.parseDouble(v)); } catch (NumberFormatException nf) { cfg.set(path, v); }
+        }
+    }
+
+    // ------------------------------------------------------------------ terreno
+    private int baseX(int slot) { return slot * SLOT_SPACING; }
+
+    /** Cola (ou restaura) o terreno da onda no slot, em lotes por tick; chama done no fim. */
+    private void paste(String name, int slot, Runnable done) throws Exception {
+        File dir = waveDir(name);
+        JsonObject meta = JsonParser.parseString(Files.readString(new File(dir, "meta.json").toPath())).getAsJsonObject();
+        JsonArray sz = meta.getAsJsonArray("size"), pal = meta.getAsJsonArray("palette"), o = meta.getAsJsonArray("origin");
+        int sx = sz.get(0).getAsInt(), sy = sz.get(1).getAsInt(), szz = sz.get(2).getAsInt();
+        int x0 = baseX(slot), y0 = o.get(1).getAsInt(), z0 = 0;
+        Material[] mats = new Material[pal.size()];
+        for (int i = 0; i < mats.length; i++) {
+            Material m = Material.matchMaterial(pal.get(i).getAsString());
+            mats[i] = m == null || !m.isBlock() ? Material.STONE : m;
+        }
+        byte[] data;
+        try (GZIPInputStream in = new GZIPInputStream(new FileInputStream(new File(dir, "terrain.bin.gz")))) { data = in.readAllBytes(); }
+        int[] oldBox = boxes[slot];
+        int[] box = new int[]{x0, y0, z0, sx, sy, szz};
+        boxes[slot] = box;
+        for (int cx = (x0 >> 4) - 1; cx <= ((x0 + sx) >> 4) + 1; cx++)
+            for (int cz = (z0 >> 4) - 1; cz <= ((z0 + szz) >> 4) + 1; cz++) world.setChunkForceLoaded(cx, cz, true);
+        final byte[] d = data;
+        final int total = sx * szz * sy;
+        new org.bukkit.scheduler.BukkitRunnable() {
+            int i = 0, clearI = 0;
+            final int clearTotal = oldBox == null || java.util.Arrays.equals(oldBox, box) ? 0 : oldBox[3] * oldBox[4] * oldBox[5];
+            @Override public void run() {
+                int budget = 60_000;
+                while (clearI < clearTotal && budget-- > 0) { // limpa a colagem anterior do slot (outra onda)
+                    int k = clearI++;
+                    int y = k % oldBox[4], z = (k / oldBox[4]) % oldBox[5], x = k / (oldBox[4] * oldBox[5]);
+                    world.getBlockAt(oldBox[0] + x, oldBox[1] + y, oldBox[2] + z).setType(Material.AIR, false);
+                }
+                while (i < total && budget-- > 0) {
+                    int k = i++;
+                    int y = k % sy, z = (k / sy) % szz, x = k / (sy * szz);
+                    Material m = mats[d[k] & 0xff];
+                    Block b = world.getBlockAt(x0 + x, y0 + y, z0 + z);
+                    if (b.getType() != m) b.setType(m, false);
+                }
+                if (i >= total && clearI >= clearTotal) {
+                    cancel();
+                    // so os blocos de horda deste slot saem da lista (os outros slots seguem rodando)
+                    SmartHorde.ZPLACED.removeIf(b -> b.getWorld() == world && b.getX() >= x0 - 50 && b.getX() < x0 + SLOT_SPACING - 50);
+                    done.run();
+                }
+            }
+        }.runTaskTimer(plugin, 1L, 1L);
+    }
+
+    // ------------------------------------------------------------------ rodada
+    private void start(String name, int slot, String strat, int secs, String tg) throws Exception {
+        File dir = waveDir(name);
+        JsonObject meta = JsonParser.parseString(Files.readString(new File(dir, "meta.json").toPath())).getAsJsonObject();
+        JsonArray o = meta.getAsJsonArray("origin");
+        double dx = baseX(slot) - o.get(0).getAsInt(), dz = -o.get(2).getAsInt(); // onda -> slot
+        Round r = new Round();
+        r.slot = slot;
+        List<Location> spots = new ArrayList<>();
+        List<Integer> roles = new ArrayList<>();
+        try (BufferedReader rd = new BufferedReader(new InputStreamReader(
+                new GZIPInputStream(new FileInputStream(new File(dir, "frames.jsonl.gz"))), StandardCharsets.UTF_8))) {
+            String line;
+            boolean first = true;
+            while (true) {
+                try { line = rd.readLine(); } catch (java.io.EOFException eof) { break; }
+                if (line == null) break;
+                if (line.isBlank()) continue;
+                JsonObject f;
+                try { f = JsonParser.parseString(line).getAsJsonObject(); } catch (Exception bad) { break; }
+                if (first) {
+                    for (JsonElement ze : f.getAsJsonArray("z")) {
+                        JsonArray z = ze.getAsJsonArray();
+                        spots.add(new Location(world, z.get(2).getAsDouble() + dx, z.get(3).getAsDouble(), z.get(4).getAsDouble() + dz));
+                        roles.add(z.get(1).getAsInt());
+                    }
+                    first = false;
+                }
+                JsonArray ps = f.getAsJsonArray("p");
+                if (ps.size() > 0) {
+                    JsonArray p = ps.get(0).getAsJsonArray();
+                    r.path.add(new double[]{f.get("t").getAsDouble(), p.get(1).getAsDouble() + dx, p.get(2).getAsDouble(), p.get(3).getAsDouble() + dz});
+                }
+            }
+        }
+        if (spots.isEmpty() || r.path.isEmpty()) { plugin.getLogger().warning("ARENA_ERROR " + tg + " onda sem zumbis ou sem jogador"); return; }
+        double[] p0 = r.path.get(0);
+        r.dummy = world.spawn(new Location(world, p0[1], p0[2], p0[3]), Villager.class, v -> {
+            v.setAI(false); v.setSilent(true); v.setPersistent(true); v.setRemoveWhenFarAway(false);
+            v.setGravity(false); v.customName(net.kyori.adventure.text.Component.text("alvo"));
+        });
+        SmartHorde.EXTRA_TARGETS.add(r.dummy.getUniqueId());
+        HP.put(r.dummy.getUniqueId(), 20.0);
+        r.strategy = strat; r.tag = tg; r.wave = name;
+        r.startTick = Bukkit.getCurrentTick(); r.maxTicks = secs * 20;
+        r.zombies.addAll(horde.spawnExact(world, spots, roles, r.dummy));
+        rounds.put(slot, r);
+        byDummy.put(r.dummy.getUniqueId(), r);
+        if (!watch && !sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint 20000000"); sprinting = true; }
+        if (task == null) task = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 1L, 1L);
+        for (org.bukkit.entity.Player pl : Bukkit.getOnlinePlayers()) if (rounds.size() == 1) watchPlayer(pl);
+        plugin.getLogger().info("ARENA_START " + name + " " + strat + " " + secs + "s slot " + slot + " (" + spots.size() + " zumbis) " + tg);
+    }
+
+    private void tick() {
+        for (Round r : new ArrayList<>(rounds.values())) tickRound(r);
+        if (rounds.isEmpty() && pasting.isEmpty()) {
+            if (sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint stop"); sprinting = false; }
+            if (task != null) { task.cancel(); task = null; }
+        }
+        if (!Bukkit.getOnlinePlayers().isEmpty() && Bukkit.getCurrentTick() % 10 == 0) labels();
+    }
+
+    private void tickRound(Round r) {
+        if (r.dummy == null || !r.dummy.isValid()) { finish(r, "alvo sumiu"); return; }
+        int t = Bukkit.getCurrentTick() - r.startTick;
+        UUID id = r.dummy.getUniqueId();
+        double hp = hp(id);
+        if (hp < 20 && t - r.lastHurt > 80 && t % 80 == 0) HP.put(id, Math.min(20, hp + 1)); // regeneracao natural
+        switch (r.strategy) {
+            case "replay" -> replay(r, t);
+            case "pillar" -> { pillar(r, t); breakStruct(r, t); }
+            case "fighter" -> fight(r, t);
+            case "smart" -> { pillar(r, t); breakStruct(r, t); fight(r, t); }
+            default -> { }
+        }
+        if (t % 10 == 0) { Zombie nz = nearest(r, 64); if (nz != null) r.minDist = Math.min(r.minDist, nz.getLocation().distance(r.dummy.getLocation())); }
+        if (hp(id) <= 0) { finish(r, "morreu"); return; }
+        if (t >= r.maxTicks) { finish(r, "tempo"); return; }
+        if (t % 20 == 0 && horde.statsFor(r.zombies)[0] == 0) finish(r, "horda morta");
+    }
+
+    /** Nome + acao em cima de cada zumbi (so quando tem alguem assistindo). */
+    private void labels() {
+        horde.forEachState((z, role, action, inv) -> {
+            z.customName(net.kyori.adventure.text.Component.text(role + " [" + inv + "] " + action));
+            z.setCustomNameVisible(true);
+        });
+        for (Round r : rounds.values()) {
+            r.dummy.customName(net.kyori.adventure.text.Component.text("ALVO " + Math.round(hp(r.dummy.getUniqueId()) * 10) / 10.0 + " vida"));
+            r.dummy.setCustomNameVisible(true);
+        }
+    }
+
+    @EventHandler
+    public void onJoin(org.bukkit.event.player.PlayerJoinEvent e) {
+        Bukkit.getScheduler().runTaskLater(plugin, () -> watchPlayer(e.getPlayer()), 5L);
+    }
+
+    /** Auto_Math entra criativo (voa e pode mexer); outros como espectador. A horda ignora os dois. */
+    private void watchPlayer(org.bukkit.entity.Player p) {
+        p.setGameMode(p.getName().equals("Auto_Math") ? org.bukkit.GameMode.CREATIVE : org.bukkit.GameMode.SPECTATOR);
+        p.setAllowFlight(true);
+        p.setFlying(true);
+        Round any = rounds.values().stream().findFirst().orElse(null);
+        Location to = any != null ? any.dummy.getLocation().add(8, 6, 8) : world.getSpawnLocation();
+        if (any != null) to.setDirection(any.dummy.getLocation().toVector().subtract(to.toVector()));
+        p.teleport(to);
+        p.sendMessage("Arena (" + slots + " slots, " + rounds.size() + " rodando). Slots ficam a cada " + SLOT_SPACING + " blocos no eixo X.");
+    }
+
+    private void replay(Round r, int t) {
+        double ms = t * 50.0;
+        while (r.pathIdx + 1 < r.path.size() && r.path.get(r.pathIdx + 1)[0] <= ms) r.pathIdx++;
+        double[] p = r.path.get(r.pathIdx);
+        Location cur = r.dummy.getLocation();
+        if (Math.abs(cur.getX() - p[1]) + Math.abs(cur.getY() - p[2]) + Math.abs(cur.getZ() - p[3]) > 0.05)
+            r.dummy.teleport(new Location(world, p[1], p[2], p[3], cur.getYaw(), cur.getPitch()));
+    }
+
+    private Zombie nearest(Round r, double max) {
+        Zombie best = null; double bd = max * max;
+        for (Entity e : r.dummy.getNearbyEntities(max, max, max)) {
+            if (!(e instanceof Zombie z) || !horde.isHorde(z)) continue;
+            double d = z.getLocation().distanceSquared(r.dummy.getLocation());
+            if (d < bd) { bd = d; best = z; }
+        }
+        return best;
+    }
+
+    /** Sobe em pilar (ate 10) quando a horda chega a 30 blocos: 1 bloco a cada 0,5 s. */
+    private void pillar(Round r, int t) {
+        if (t % 10 != 0 || r.built >= 10 || nearest(r, 30) == null) return;
+        Block feet = r.dummy.getLocation().getBlock();
+        if (!feet.getRelative(0, 2, 0).isPassable()) return;
+        r.dummy.teleport(r.dummy.getLocation().add(0, 1, 0));
+        feet.setType(Material.COBBLESTONE, false);
+        r.built++;
+    }
+
+    /** Derruba o bloco colocado pela horda embaixo do zumbi mais alto ao alcance (4,5 blocos). */
+    private void breakStruct(Round r, int t) {
+        if (t % 8 != 0) return;
+        Location eye = r.dummy.getEyeLocation();
+        Block best = null; double by = -1e9;
+        for (Entity e : r.dummy.getNearbyEntities(5, 6, 5)) {
+            if (!(e instanceof Zombie z) || !horde.isHorde(z)) continue;
+            Block under = z.getLocation().getBlock().getRelative(0, -1, 0);
+            if (!SmartHorde.ZPLACED.contains(under)) continue;
+            if (under.getLocation().add(0.5, 0.5, 0.5).distance(eye) > 4.5) continue;
+            if (z.getLocation().getY() > by) { by = z.getLocation().getY(); best = under; }
+        }
+        if (best != null) { best.setType(Material.AIR); SmartHorde.ZPLACED.remove(best); r.broke++; }
+    }
+
+    /** Espada: 6 de dano a cada 0,6 s no zumbi mais perto (alcance 3), com empurrao. */
+    private void fight(Round r, int t) {
+        if (t % 12 != 0) return;
+        Zombie z = nearest(r, 3);
+        if (z == null) return;
+        z.damage(6, r.dummy);
+        Vector kb = z.getLocation().toVector().subtract(r.dummy.getLocation().toVector()).setY(0);
+        if (kb.lengthSquared() > 0.01) z.setVelocity(kb.normalize().multiply(0.4).setY(0.3));
+        r.swings++;
+    }
+
+    @EventHandler
+    public void onDamage(EntityDamageEvent e) {
+        Round r = byDummy.get(e.getEntity().getUniqueId());
+        if (r == null) return;
+        e.setCancelled(true); // a vida do substituto e nossa (com armadura), nao a do aldeao
+        if (!(e instanceof EntityDamageByEntityEvent by) || !(by.getDamager() instanceof Zombie)) return;
+        double d = e.getDamage() * (1 - ARMOR);
+        HP.merge(r.dummy.getUniqueId(), -d, Double::sum);
+        r.dmg += d;
+        r.hits++;
+        r.lastHurt = Bukkit.getCurrentTick() - r.startTick;
+        if (r.firstHit < 0) r.firstHit = r.lastHurt;
+    }
+
+    @EventHandler
+    public void onTransform(EntityTransformEvent e) {
+        if (byDummy.containsKey(e.getEntity().getUniqueId())) e.setCancelled(true);
+    }
+
+    private void finish(Round r, String why) {
+        if (rounds.get(r.slot) != r) return;
+        rounds.remove(r.slot);
+        int t = Bukkit.getCurrentTick() - r.startTick;
+        int[] st = horde.statsFor(r.zombies);
+        horde.removeAll(r.zombies);
+        boolean died = r.dummy != null && hp(r.dummy.getUniqueId()) <= 0;
+        if (r.dummy != null) {
+            UUID id = r.dummy.getUniqueId();
+            SmartHorde.EXTRA_TARGETS.remove(id); HP.remove(id); byDummy.remove(id); r.dummy.remove();
+        }
+        String json = String.format(java.util.Locale.ROOT,
+                "{\"wave\":\"%s\",\"strategy\":\"%s\",\"tag\":\"%s\",\"end\":\"%s\",\"survival\":%.1f,\"died\":%b,\"dmg\":%.1f,"
+                        + "\"hits\":%d,\"zombies_alive\":%d,\"zombie_blocks_left\":%d,\"player_built\":%d,\"player_broke\":%d,\"swings\":%d,\"min_dist\":%.1f,\"first_hit\":%.1f,\"slot\":%d}",
+                r.wave, r.strategy, r.tag, why, t / 20.0, died, r.dmg, r.hits, st[0], st[1], r.built, r.broke, r.swings,
+                r.minDist > 1e8 ? 99.0 : r.minDist, r.firstHit < 0 ? -1.0 : r.firstHit / 20.0, r.slot);
+        plugin.getLogger().info("ARENA_RESULT " + json);
+    }
+}
