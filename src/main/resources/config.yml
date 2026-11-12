@@ -42,6 +42,8 @@ horde:
                             # (base de pedregulho, tijolo, madeira, vidro ou pedra lapidada fica segura)
   drowned: true             # alguns viram afogados da horda na agua: nadam rapido e alcancam quem esta nela
   p:
+    pillar_max_dy: 4        # pilar individual so ate esta altura; acima, rampa coletiva
+    pioneer_max_dy: 6       # pioneiro so age ate esta altura
     drowned_chance: 0.4     # chance de virar afogado (sorteada uma vez, depois de 3 s na agua)
     drowned_chance_defense: 0.8  # se o alvo se defende com agua (nadando, barco, ilha, fosso)
     diver_share: 0.6        # guerreiros que mergulham de proposito contra defesa de agua

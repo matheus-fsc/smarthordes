@@ -725,7 +725,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
             double dyR = tl.getY() - zl.getY();
             boolean rampOn = ramps.containsKey(t.getUniqueId()) ? dyR >= 1 : dyR >= P("ramp_min_dy", 3);
             // PIONEIRO: um construtor por alvo faz o proprio pilar/ponte direto (rapido) enquanto a rampa sobe
-            if (rampOn && opt("ramp-pioneer") && isPioneer(z, s, t)) { rampOn = false; s.action = "pioneiro: caminho proprio"; }
+            if (rampOn && opt("ramp-pioneer") && dyR <= P("pioneer_max_dy", 6) && isPioneer(z, s, t)) { rampOn = false; s.action = "pioneiro: caminho proprio"; }
             boolean wasRamp = s.rampMode;
             s.rampMode = false;
             if (tool(s) != null && opt("ramp") && !s.gathering && rampOn) {
@@ -1002,7 +1002,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         }
         // 1b) alvo acima e perto (ou parede na frente): sobe em pilar.
         //    Prioridade sobre cavar para o lado: cavar a parede nao ajuda a subir.
-        if (dy >= 2 && (horiz < 3 || wall)) {
+        // pilar so para alturas pequenas: alto demais e lento, um por vez, e cai com qualquer empurrao (rampa resolve)
+        if (dy >= 2 && dy <= P("pillar_max_dy", 4) && (horiz < 3 || wall)) {
             Block ceiling = feet.getRelative(BlockFace.UP, 2);
             if (!ceiling.isPassable()) { // teto/saliencia: quebra primeiro
                 if (canBreak(s, ceiling)) progressBreak(z, s, ceiling);
