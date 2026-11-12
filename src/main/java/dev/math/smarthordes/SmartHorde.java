@@ -56,6 +56,14 @@ final class SmartHorde implements org.bukkit.event.Listener {
         long breakStart;
         long lastPlace;
         int tick;
+        /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
+        Location swimTo;
+        /** Ticks seguidos na agua e se ja sorteou virar afogado nesta vida. */
+        int waterTicks;
+        boolean drownRolled;
+        /** Escolhido para mergulhar de proposito quando o alvo se defende com agua (sorteado uma vez). */
+        Boolean diver;
+        Location diveTo;
         /** Inventario de blocos: so constroi com o que carrega (e o que carrega veio do que quebrou). */
         final java.util.EnumMap<Material, Integer> inv = new java.util.EnumMap<>(Material.class);
         int invTotal;
@@ -135,12 +143,15 @@ final class SmartHorde implements org.bukkit.event.Listener {
         this.plugin = plugin;
         this.key = new NamespacedKey(plugin, "horde");
         Bukkit.getPluginManager().registerEvents(this, plugin);
+        Bukkit.getScheduler().runTaskTimer(plugin, this::swimTick, 2L, 2L);
         plugin.getConfig().addDefault("horde.block-capacity", 32);
         plugin.getConfig().addDefault("horde.debug", false);
         // vindos do simulador (horde-sim): cada um ligavel
         plugin.getConfig().addDefault("horde.log-to-planks", true);
         plugin.getConfig().addDefault("horde.record", true);
         plugin.getConfig().addDefault("horde.emerge", true);
+        plugin.getConfig().addDefault("horde.swim", true);
+        plugin.getConfig().addDefault("horde.drowned", true);
         plugin.getConfig().addDefault("horde.no-self-push", true);
         plugin.getConfig().addDefault("horde.ramp-wide-floating", true);
         plugin.getConfig().addDefault("horde.ramp-shapes", "straight,zigzag,spiral");
@@ -213,6 +224,151 @@ final class SmartHorde implements org.bukkit.event.Listener {
                     : m instanceof org.bukkit.entity.Piglin ? Sound.ENTITY_PIGLIN_ANGRY : Sound.ENTITY_ZOMBIE_AMBIENT, 1f, 0.7f);
             task.cancel();
         }, 1L, 1L);
+    }
+
+    // ---------------------------------------------------------------- agua
+
+    private final Map<UUID, long[]> waterDefCache = new HashMap<>();
+
+    /**
+     * O alvo esta usando agua como defesa: nadando, de barco, ou cercado de agua (ilha, fosso):
+     * metade ou mais dos pontos num anel de raio 2 a 4 em volta dele sao agua. Cache de 2 s.
+     */
+    private boolean waterDefense(LivingEntity t) {
+        long now = now();
+        long[] c = waterDefCache.get(t.getUniqueId());
+        if (c != null && now - c[0] < 2000) return c[1] == 1;
+        boolean def = t.isInWater() || t.getVehicle() instanceof org.bukkit.entity.Boat;
+        if (!def) {
+            Location l = t.getLocation();
+            World w = l.getWorld();
+            int water = 0, total = 0;
+            for (int r = 2; r <= 4; r++) {
+                for (int k = 0; k < 12; k++) {
+                    double a = Math.PI * 2 * k / 12;
+                    int x = (int) Math.floor(l.getX() + Math.cos(a) * r), z = (int) Math.floor(l.getZ() + Math.sin(a) * r);
+                    if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
+                    total++;
+                    for (int dy = -2; dy <= 0; dy++) if (w.getBlockAt(x, l.getBlockY() + dy, z).getType() == Material.WATER) { water++; break; }
+                }
+            }
+            def = total > 0 && water * 2 >= total;
+        }
+        waterDefCache.put(t.getUniqueId(), new long[]{now, def ? 1 : 0});
+        return def;
+    }
+
+    /** Bloco de agua mais util para mergulhar: perto do zumbi e na direcao do alvo. */
+    private Location nearestWater(Location from, Location toward, int R) {
+        World w = from.getWorld();
+        Location best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dx = -R; dx <= R; dx++) {
+            for (int dz = -R; dz <= R; dz++) {
+                if (dx * dx + dz * dz > R * R) continue;
+                int x = from.getBlockX() + dx, z = from.getBlockZ() + dz;
+                if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
+                for (int dy = 2; dy >= -4; dy--) {
+                    Block b = w.getBlockAt(x, from.getBlockY() + dy, z);
+                    if (b.getType() != Material.WATER) continue;
+                    if (!b.getRelative(BlockFace.UP).isPassable()) break;
+                    Location l = b.getLocation().add(0.5, 0.2, 0.5);
+                    double score = Math.sqrt(dx * dx + dz * dz) + 0.5 * l.distance(toward);
+                    if (score < bestScore) { bestScore = score; best = l; }
+                    break;
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Escolhe para onde nadar: o alvo, se ele tambem esta na agua e perto; senao a margem seca mais util. */
+    private void planSwim(Zombie z, State s, LivingEntity t) {
+        s.action = "nadando";
+        if (t != null && t.isInWater() && z.getLocation().distanceSquared(t.getLocation()) < 144) {
+            s.swimTo = t.getLocation();
+            return;
+        }
+        if (s.swimTo != null && s.tick % 4 != 0) return; // recalcula a margem a cada 2 s
+        Location zl = z.getLocation();
+        World w = zl.getWorld();
+        int R = (int) P("swim_shore_r", 10);
+        Location best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (int dx = -R; dx <= R; dx++) {
+            for (int dz = -R; dz <= R; dz++) {
+                if (dx * dx + dz * dz > R * R) continue;
+                int x = zl.getBlockX() + dx, zz = zl.getBlockZ() + dz;
+                if (!w.isChunkLoaded(x >> 4, zz >> 4)) continue;
+                for (int dy = -2; dy <= 3; dy++) {
+                    int y = zl.getBlockY() + dy;
+                    Block ground = w.getBlockAt(x, y - 1, zz), feet = w.getBlockAt(x, y, zz), head = w.getBlockAt(x, y + 1, zz);
+                    if (!ground.getType().isSolid() || ground.isLiquid() || feet.isLiquid() || head.isLiquid()
+                            || !feet.isPassable() || !head.isPassable()) continue;
+                    double score = Math.sqrt(dx * dx + dz * dz) + Math.max(0, dy) * 1.5;
+                    if (t != null) score += 0.6 * Math.sqrt(t.getLocation().distanceSquared(new Location(w, x + 0.5, y, zz + 0.5)));
+                    if (score < bestScore) { bestScore = score; best = new Location(w, x + 0.5, y, zz + 0.5); }
+                    break;
+                }
+            }
+        }
+        // sem margem por perto: nada na direcao do alvo pela superficie
+        s.swimTo = best != null ? best : t != null ? t.getLocation() : null;
+    }
+
+    /** A cada 2 ticks: boia na superficie e nada ate swimTo; perto da margem, pula para fora. */
+    private void swimTick() {
+        for (Map.Entry<UUID, State> en : horde.entrySet()) {
+            State s = en.getValue();
+            if (s.swimTo == null) continue;
+            Entity e = Bukkit.getEntity(en.getKey());
+            if (!(e instanceof Zombie z) || !z.isValid() || !z.isInWater() || s.swimTo.getWorld() != z.getWorld()) continue;
+            Location l = z.getLocation();
+            boolean headUnder = l.clone().add(0, z.getHeight() * 0.85, 0).getBlock().isLiquid();
+            Vector dir = s.swimTo.toVector().subtract(l.toVector()).setY(0);
+            double horiz = dir.length();
+            if (horiz > 0.05) dir.multiply(P("swim_speed", 0.11) / horiz);
+            double vy = headUnder ? 0.09 : Math.max(0.0, z.getVelocity().getY());
+            // chegando na margem (mais alta que a agua): pulo para sair
+            if (horiz < 1.6 && s.swimTo.getY() > l.getY() - 0.2 && !s.swimTo.getBlock().isLiquid()) vy = 0.42;
+            z.setVelocity(new Vector(dir.getX(), vy, dir.getZ()));
+            if (horiz > 0.05) z.setRotation((float) Math.toDegrees(Math.atan2(-dir.getX(), dir.getZ())), 0f);
+        }
+    }
+
+    /**
+     * Troca o zumbi por um afogado da horda no mesmo lugar: mesmo papel, ferramenta, armadura,
+     * blocos carregados, vida e alvo. O afogado nada rapido e a IA da horda continua mandando nele.
+     */
+    private void toDrowned(Zombie z, State s, LivingEntity t) {
+        Location l = z.getLocation();
+        EntityEquipment old = z.getEquipment();
+        double hp = z.getHealth();
+        org.bukkit.entity.Drowned d = l.getWorld().spawn(l, org.bukkit.entity.Drowned.class, dd -> {
+            setup(dd, s.role, t);
+            EntityEquipment eq = dd.getEquipment();
+            if (old != null && eq != null) {
+                eq.setArmorContents(old.getArmorContents());
+                eq.setItemInMainHand(old.getItemInMainHand());
+                eq.setItemInOffHand(old.getItemInOffHand());
+            }
+            attr(dd, Attribute.MOVEMENT_SPEED, s.role == 3 ? 0.24 : 0.28);
+        });
+        d.setHealth(Math.min(hp, d.getMaxHealth()));
+        s.swimTo = null;
+        horde.put(d.getUniqueId(), s);
+        horde.remove(z.getUniqueId());
+        z.remove();
+        l.getWorld().spawnParticle(Particle.BUBBLE_COLUMN_UP, l.clone().add(0, 1, 0), 20, 0.3, 0.6, 0.3, 0.05);
+        l.getWorld().playSound(l, Sound.ENTITY_ZOMBIE_CONVERTED_TO_DROWNED, 1f, 1f);
+        s.action = "virou afogado";
+    }
+
+    /** Zumbi da horda nunca vira afogado pelo jeito vanilla (afundar travava a horda; a troca e por toDrowned). */
+    @org.bukkit.event.EventHandler(ignoreCancelled = true)
+    public void onDrownConvert(org.bukkit.event.entity.EntityTransformEvent e) {
+        if (e.getTransformReason() == org.bukkit.event.entity.EntityTransformEvent.TransformReason.DROWNED
+                && horde.containsKey(e.getEntity().getUniqueId())) e.setCancelled(true);
     }
 
     private static int stagger() { return ThreadLocalRandom.current().nextInt(0, 50); }
@@ -478,7 +634,46 @@ final class SmartHorde implements org.bukkit.event.Listener {
             State s = en.getValue();
             s.tick++;
             LivingEntity t = pickTarget(z, s);
+            // NA AGUA: zumbi afunda e fica parado ate virar afogado. Nada para a margem (ou ate o alvo).
+            // afogado da horda nada sozinho (IA vanilla e rapida na agua): segue o resto da logica normal
+            if (z.isInWater() && !(z instanceof org.bukkit.entity.Drowned) && opt("swim")
+                    && (t == null || z.getLocation().distanceSquared(t.getLocation()) > 6.25)) {
+                s.waterTicks++;
+                // alguns viram AFOGADOS a favor da horda: nadam rapido e alcancam quem esta na agua
+                boolean vsWater = t != null && waterDefense(t);
+                int after = vsWater || Boolean.TRUE.equals(s.diver) ? 1 : (int) P("drowned_after", 6);
+                double chance = Boolean.TRUE.equals(s.diver) ? 1.0 : vsWater ? P("drowned_chance_defense", 0.8) : P("drowned_chance", 0.4);
+                if (!s.drownRolled && s.waterTicks >= after && !(z instanceof org.bukkit.entity.PigZombie)) {
+                    s.drownRolled = true;
+                    if (opt("drowned") && ThreadLocalRandom.current().nextDouble() < chance) {
+                        final Zombie zz = z; final LivingEntity tt = t;
+                        // fora do laco: trocar a entidade mexe no mapa da horda
+                        Bukkit.getScheduler().runTask(plugin, () -> { if (zz.isValid()) toDrowned(zz, s, tt); });
+                        continue;
+                    }
+                }
+                planSwim(z, s, t);
+                continue;
+            }
+            s.swimTo = null;
+            s.waterTicks = 0;
             if (t == null) continue;
+            // ALVO SE DEFENDE COM AGUA (nadando, de barco, ilha ou fosso): parte da horda mergulha de proposito
+            // para virar afogado; os construtores seguem tentando ponte/rampa
+            if (opt("drowned") && !(z instanceof org.bukkit.entity.Drowned) && !(z instanceof org.bukkit.entity.PigZombie)
+                    && !s.drownRolled && waterDefense(t)) {
+                if (s.diver == null) s.diver = tool(s) == null ? ThreadLocalRandom.current().nextDouble() < P("diver_share", 0.6)
+                        : ThreadLocalRandom.current().nextDouble() < P("diver_share_builders", 0.2);
+                if (s.diver) {
+                    if (s.diveTo == null || s.tick % 6 == 0) s.diveTo = nearestWater(z.getLocation(), t.getLocation(), (int) P("dive_search_r", 14));
+                    if (s.diveTo != null) {
+                        if (z.getTarget() != null) z.setTarget(null);
+                        z.getPathfinder().moveTo(s.diveTo, 1.15);
+                        s.action = "mergulhando para virar afogado";
+                        continue;
+                    }
+                }
+            }
             if (!s.rampMode && z.getTarget() != t) z.setTarget(t);
 
             Location zl = z.getLocation(), tl = t.getLocation();
