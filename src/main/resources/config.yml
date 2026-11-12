@@ -58,6 +58,7 @@ horde:
   dig-stairs: true
   escape-ceiling: true
   warrior-escort: true
+  clear-leaves: true        # tiram na mao as folhas que travam o caminho (pinheiro com galho ate o chao)
   fell-whole-tree: true     # lenhador derruba a arvore inteira (sem toco flutuando)
   tidy-gather: true         # coleta organizada: um buraco so, de cima para baixo, sem furos espalhados
   log-to-planks: true

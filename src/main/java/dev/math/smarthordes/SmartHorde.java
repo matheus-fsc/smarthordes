@@ -164,6 +164,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.ramp-pioneer", true);
         plugin.getConfig().addDefault("horde.ramp-widen", true);
         plugin.getConfig().addDefault("horde.fight-golems", true);
+        plugin.getConfig().addDefault("horde.clear-leaves", true);
         plugin.getConfig().addDefault("horde.break-turrets", true);
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
@@ -682,6 +683,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
             s.waterTicks = 0;
             if (t == null) continue;
             if (defenseTick(z, s, now())) { debug(z, s, z.getLocation().distance(t.getLocation()), 0); continue; }
+            if (opt("clear-leaves")) clearLeaves(z, t);
             // ALVO SE DEFENDE COM AGUA (nadando, de barco, ilha ou fosso): parte da horda mergulha de proposito
             // para virar afogado; os construtores seguem tentando ponte/rampa
             if (opt("drowned") && !(z instanceof org.bukkit.entity.Drowned) && !(z instanceof org.bukkit.entity.PigZombie)
@@ -1878,6 +1880,37 @@ final class SmartHorde implements org.bukkit.event.Listener {
             s.action = "indo quebrar torre";
         }
         return true;
+    }
+
+    /**
+     * Folhas (pinheiro principalmente: galhos ate o chao) travam o pathfinder vanilla. Sai na mao e rapido, como no
+     * vanilla: tira as folhas no corpo, na frente (na direcao do alvo) e acima da cabeca; em cima da copa com o alvo
+     * mais baixo, tira a folha do pe e desce. Ate 3 folhas por meio segundo por zumbi.
+     */
+    private void clearLeaves(Zombie z, LivingEntity t) {
+        Location zl = z.getLocation();
+        Block feet = zl.getBlock();
+        Vector d = t.getLocation().toVector().subtract(zl.toVector()).setY(0);
+        int fx = 0, fz = 0;
+        if (d.lengthSquared() > 0.01) {
+            if (Math.abs(d.getX()) >= Math.abs(d.getZ())) fx = (int) Math.signum(d.getX()); else fz = (int) Math.signum(d.getZ());
+        }
+        List<Block> check = new ArrayList<>(List.of(feet, feet.getRelative(BlockFace.UP), feet.getRelative(0, 2, 0)));
+        if (fx != 0 || fz != 0) {
+            check.add(feet.getRelative(fx, 0, fz));
+            check.add(feet.getRelative(fx, 1, fz));
+        }
+        if (t.getLocation().getY() < zl.getY() - 1.5) check.add(feet.getRelative(BlockFace.DOWN)); // descer da copa
+        int n = 0;
+        for (Block b : check) {
+            if (!Tag.LEAVES.isTagged(b.getType()) || ZPLACED.contains(b)) continue;
+            b.getWorld().spawnParticle(Particle.BLOCK, b.getLocation().add(0.5, 0.5, 0.5), 8, 0.3, 0.3, 0.3, b.getBlockData());
+            b.getWorld().playSound(b.getLocation(), Sound.BLOCK_GRASS_BREAK, 0.6f, 1f);
+            if (REC != null) REC.block(b, Material.AIR);
+            b.setType(Material.AIR);
+            if (++n >= 3) break;
+        }
+        if (n > 0) z.swingMainHand();
     }
 
     private final Map<UUID, UUID> pioneers = new HashMap<>();
