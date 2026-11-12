@@ -58,6 +58,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         int tick;
         /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
         Location swimTo;
+        /** Ate quando prefere cavar escada no morro em vez de rampa (reavalia a cada 8 s). */
+        long digUntil;
         /** Golem que bateu nele (guerreiro revida por alguns segundos) e torre que ele foi quebrar. */
         UUID golem;
         long golemUntil;
@@ -165,6 +167,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.ramp-widen", true);
         plugin.getConfig().addDefault("horde.fight-golems", true);
         plugin.getConfig().addDefault("horde.clear-leaves", true);
+        plugin.getConfig().addDefault("horde.prefer-dig-stairs", true);
         plugin.getConfig().addDefault("horde.break-turrets", true);
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
@@ -733,6 +736,9 @@ final class SmartHorde implements org.bukkit.event.Listener {
             // histerese: entra na rampa com o alvo 3+ acima; so sai se ficar menos de 1 acima
             double dyR = tl.getY() - zl.getY();
             boolean rampOn = ramps.containsKey(t.getUniqueId()) ? dyR >= 1 : dyR >= P("ramp_min_dy", 3);
+            // MORRO ENTRE A HORDA E O ALVO: cavar a escada (1 sobe por 1 andado) e mais barato que rampa de blocos
+            if (rampOn && tool(s) != null && opt("prefer-dig-stairs") && s.digUntil < now && digPathOk(z, s, t)) s.digUntil = now + 8000;
+            if (rampOn && s.digUntil > now) { rampOn = false; s.action = "escada cavada ate o alvo"; }
             // PIONEIRO: um construtor por alvo faz o proprio pilar/ponte direto (rapido) enquanto a rampa sobe
             if (rampOn && opt("ramp-pioneer") && dyR <= P("pioneer_max_dy", 6) && isPioneer(z, s, t)) { rampOn = false; s.action = "pioneiro: caminho proprio"; }
             boolean wasRamp = s.rampMode;
@@ -967,6 +973,11 @@ final class SmartHorde implements org.bukkit.event.Listener {
 
         // 1a) alvo acima mas longe na horizontal: escadaria de blocos na direcao dele (sobe 1 por bloco andado)
         boolean wall = !front.isPassable() || !frontHead.isPassable();
+        if (s.digUntil > now && dy >= 2 && !wall) { // vai cavar o morro: anda ate o pe dele, sem gastar bloco no caminho
+            z.getPathfinder().moveTo(tl, 1.0);
+            s.action = "indo ate o morro para cavar";
+            return;
+        }
         if (dy >= 2 && horiz >= P("stair_min_horiz", 3) && !wall) {
             Block feetUp2 = feet.getRelative(BlockFace.UP, 2), frontUp2 = front.getRelative(BlockFace.UP, 2);
             if (feetUp2.isPassable() && frontUp2.isPassable()) {
@@ -1911,6 +1922,34 @@ final class SmartHorde implements org.bukkit.event.Listener {
             if (++n >= 3) break;
         }
         if (n > 0) z.swingMainHand();
+    }
+
+    /**
+     * Da para chegar no alvo cavando uma escada? Segue a diagonal (1 para cima a cada 1 para frente) do zumbi ate a
+     * altura do alvo: os blocos do caminho (pe e cabeca) precisam ser cavaveis ou ja livres, e o degrau de cada passo
+     * precisa ter chao (natural). Se a diagonal e quase toda ar, e um vao aberto: rampa e melhor.
+     */
+    private boolean digPathOk(Zombie z, State s, LivingEntity t) {
+        Location zl = z.getLocation(), tl = t.getLocation();
+        int dy = (int) Math.round(tl.getY() - zl.getY());
+        Vector d = tl.toVector().subtract(zl.toVector()).setY(0);
+        double horiz = d.length();
+        if (dy < 2 || horiz < dy - 1 || horiz > dy + P("dig_extra_horiz", 10)) return false;
+        d.normalize();
+        Block feet = zl.getBlock();
+        int solid = 0, floorMissing = 0;
+        for (int i = 1; i <= dy; i++) {
+            int x = (int) Math.floor(zl.getX() + d.getX() * i), z2 = (int) Math.floor(zl.getZ() + d.getZ() * i);
+            Block step = feet.getWorld().getBlockAt(x, feet.getY() + i, z2);
+            for (Block c : new Block[]{step, step.getRelative(BlockFace.UP)}) {
+                if (c.isPassable()) continue;
+                if (!canDig(s, c)) return false; // bloco que ele nao cava (base do jogador, minerio, bedrock): nao da
+                solid++;
+            }
+            Block floor = step.getRelative(BlockFace.DOWN);
+            if (floor.isPassable() || floor.isLiquid()) floorMissing++;
+        }
+        return floorMissing <= 1 && solid >= dy; // morro de verdade (caminho em boa parte solido) e com chao
     }
 
     private final Map<UUID, UUID> pioneers = new HashMap<>();

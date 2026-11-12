@@ -56,6 +56,7 @@ horde:
   ramp-shapes: "straight,zigzag,spiral"
   ramp-wide-floating: true
   dig-stairs: true
+  prefer-dig-stairs: true   # morro entre a horda e o alvo: cava a escada em vez de montar rampa de blocos
   escape-ceiling: true
   warrior-escort: true
   clear-leaves: true        # tiram na mao as folhas que travam o caminho (pinheiro com galho ate o chao)
