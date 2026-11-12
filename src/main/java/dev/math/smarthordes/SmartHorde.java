@@ -157,6 +157,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.swim", true);
         plugin.getConfig().addDefault("horde.cave-miners", true);
         plugin.getConfig().addDefault("horde.ramp-repair", true);
+        plugin.getConfig().addDefault("horde.ramp-pioneer", true);
+        plugin.getConfig().addDefault("horde.ramp-widen", true);
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
         plugin.getConfig().addDefault("horde.drowned", true);
@@ -722,6 +724,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
             // histerese: entra na rampa com o alvo 3+ acima; so sai se ficar menos de 1 acima
             double dyR = tl.getY() - zl.getY();
             boolean rampOn = ramps.containsKey(t.getUniqueId()) ? dyR >= 1 : dyR >= P("ramp_min_dy", 3);
+            // PIONEIRO: um construtor por alvo faz o proprio pilar/ponte direto (rapido) enquanto a rampa sobe
+            if (rampOn && opt("ramp-pioneer") && isPioneer(z, s, t)) { rampOn = false; s.action = "pioneiro: caminho proprio"; }
             boolean wasRamp = s.rampMode;
             s.rampMode = false;
             if (tool(s) != null && opt("ramp") && !s.gathering && rampOn) {
@@ -1515,6 +1519,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         boolean broken;
         /** Conserto em andamento: 1 = curva desobstruida/apoio colocado no degrau fixIndex; 2 = desmontou dali pra cima. */
         int fixStage, fixIndex = -1;
+        /** Quem esta alargando a rampa (degraus ja feitos ganham um bloco do lado: 2 de largura). */
+        final java.util.Set<UUID> wideners = new java.util.HashSet<>();
         UUID worker; // 1 construtor por vez na rampa (1 de largura: mais de um empurra e cai)
         UUID carrier; long carrierSince; // quem esta levando blocos ate o construtor
         long workerEmptySince;
@@ -1792,6 +1798,71 @@ final class SmartHorde implements org.bukkit.event.Listener {
      * inventario) e marca a rampa para replanejar: o plano novo reaproveita a parte de baixo (extend).
      * Devolve o que fez, ou null se nao ha o que consertar.
      */
+    private final Map<UUID, UUID> pioneers = new HashMap<>();
+
+    /** Um pioneiro por alvo: o construtor (com ferramenta) que tiver mais blocos; troca se ele morrer ou mudar de alvo. */
+    private boolean isPioneer(Zombie z, State s, LivingEntity t) {
+        if (tool(s) == null) return false;
+        UUID cur = pioneers.get(t.getUniqueId());
+        State cs = cur == null ? null : horde.get(cur);
+        Entity ce = cur == null ? null : Bukkit.getEntity(cur);
+        if (cs == null || ce == null || ce.isDead() || !t.getUniqueId().equals(cs.target)) {
+            UUID best = null;
+            int most = -1;
+            for (var en : horde.entrySet()) {
+                State o = en.getValue();
+                if (!t.getUniqueId().equals(o.target) || tool(o) == null || o.role == LUMBER) continue;
+                if (o.invTotal > most) { most = o.invTotal; best = en.getKey(); }
+            }
+            if (best == null) return false;
+            pioneers.put(t.getUniqueId(), best);
+            cur = best;
+        }
+        return z.getUniqueId().equals(cur);
+    }
+
+    /**
+     * ALARGADOR: em vez de esperar na base, coloca um bloco ao lado dos degraus ja construidos (lado oposto aos
+     * recuos de espera), sempre 2 degraus atras do construtor da vez. Rampa de 2: mais gente sobe e menos gente cai.
+     * Retorna true se esta trabalhando nisso.
+     */
+    private boolean widenTick(Zombie z, State s, Ramp r) {
+        if (s.invTotal == 0) { r.wideners.remove(z.getUniqueId()); return false; }
+        r.wideners.removeIf(id -> { Entity e = Bukkit.getEntity(id); return e == null || e.isDead(); });
+        if (!r.wideners.contains(z.getUniqueId())) {
+            if (r.wideners.size() >= Pi("ramp_wideners", 1)) return false;
+            r.wideners.add(z.getUniqueId());
+        }
+        int top = -1;
+        for (int i = 0; i < r.steps.size(); i++) { if (!r.steps.get(i).getType().isSolid()) break; top = i; }
+        Location zl = z.getLocation();
+        for (int j = 0; j <= top - 2; j++) {
+            Block st = r.steps.get(j);
+            Block nx = r.steps.get(Math.min(j + 1, r.steps.size() - 1));
+            int dx = Integer.signum(nx.getX() - st.getX()), dz = Integer.signum(nx.getZ() - st.getZ());
+            if (dx == 0 && dz == 0) continue;
+            for (int side : new int[]{1, -1}) {
+                Block w = st.getRelative(dz * side, 0, -dx * side);
+                if (!w.isPassable() || w.isLiquid() || r.steps.contains(w) || r.lanes.contains(w)) continue;
+                if (!w.getRelative(BlockFace.UP).isPassable() || !w.getRelative(0, 2, 0).isPassable() || occupied(w, z)) continue;
+                Location c = w.getLocation().add(0.5, 0.5, 0.5);
+                if (zl.distance(c) <= 4.5) {
+                    w.setType(takeBlock(s));
+                    placeFx(w);
+                    z.swingMainHand();
+                    s.action = "alargando a rampa (degrau " + (j + 1) + ")";
+                    return true;
+                }
+                Block stand = j == 0 ? r.entry : r.steps.get(j - 1).getRelative(BlockFace.UP);
+                z.getPathfinder().moveTo(stand.getLocation().add(0.5, 0, 0.5), 1.1);
+                s.action = "indo alargar a rampa";
+                return true;
+            }
+        }
+        r.wideners.remove(z.getUniqueId());
+        return false;
+    }
+
     private String repairRamp(Zombie z, State s, Ramp r) {
         Block under = z.getLocation().getBlock().getRelative(BlockFace.DOWN);
         int i = r.steps.indexOf(under);
@@ -1982,6 +2053,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
                 return true;
             }
         }
+        if (!z.getUniqueId().equals(r.worker) && opt("ramp-widen") && widenTick(z, s, r)) return true;
         if (!z.getUniqueId().equals(r.worker)) { // espera no chao, em formacao (cada um no seu ponto do anel)
             List<UUID> mates = new ArrayList<>();
             for (var en : horde.entrySet()) if (t.getUniqueId().equals(en.getValue().target)) mates.add(en.getKey());

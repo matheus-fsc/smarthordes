@@ -48,6 +48,8 @@ horde:
     diver_share_builders: 0.2  # construtores que mergulham (o resto tenta ponte/rampa)
   surround: true
   ramp: true
+  ramp-pioneer: true        # 1 construtor por alvo faz o proprio pilar/ponte direto enquanto a rampa sobe
+  ramp-widen: true          # quem esperaria na base alarga a rampa ja feita (2 de largura, para hordas grandes)
   ramp-repair: true         # rampa travada na curva: conserta o canto ou desmonta o trecho de cima e refaz
   ramp-shapes: "straight,zigzag,spiral"
   ramp-wide-floating: true
