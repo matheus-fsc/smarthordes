@@ -38,6 +38,8 @@ nether-horde:
 horde:
   emerge: true              # mobs saem de dentro da terra com animacao
   swim: true                # na agua, nadam ate a margem (nunca afundam ate virar afogado sozinhos)
+  cave-miners: true         # alvo no subsolo: horda so de mineradores que cavam blocos naturais da caverna
+                            # (base de pedregulho, tijolo, madeira, vidro ou pedra lapidada fica segura)
   drowned: true             # alguns viram afogados da horda na agua: nadam rapido e alcancam quem esta nela
   p:
     drowned_chance: 0.4     # chance de virar afogado (sorteada uma vez, depois de 3 s na agua)

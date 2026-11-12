@@ -58,6 +58,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         int tick;
         /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
         Location swimTo;
+        /** Horda de caverna: so mineradores, que cavam qualquer bloco natural da caverna (e so eles). */
+        boolean cave;
         /** Ticks seguidos na agua e se ja sorteou virar afogado nesta vida. */
         int waterTicks;
         boolean drownRolled;
@@ -151,6 +153,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.record", true);
         plugin.getConfig().addDefault("horde.emerge", true);
         plugin.getConfig().addDefault("horde.swim", true);
+        plugin.getConfig().addDefault("horde.cave-miners", true);
         plugin.getConfig().addDefault("horde.drowned", true);
         plugin.getConfig().addDefault("horde.no-self-push", true);
         plugin.getConfig().addDefault("horde.ramp-wide-floating", true);
@@ -384,6 +387,12 @@ final class SmartHorde implements org.bukkit.event.Listener {
 
     /** cycle: ordem dos papeis (define a mistura da horda). */
     void spawn(World w, List<Location> spots, int count, LivingEntity target, int[] cycle) {
+        // alvo no subsolo: horda so de mineradores, que cavam os blocos naturais da caverna ate ele
+        boolean cave = opt("cave-miners") && underground(target.getLocation());
+        if (cave) {
+            cycle = new int[]{MINER};
+            plugin.getLogger().info("Horda de caverna: " + count + " mineradores atras de " + target.getName());
+        }
         for (int i = 0; i < count; i++) {
             Location base = spots.get(i % spots.size()).clone();
             Biome b = w.getBiome(base);
@@ -392,6 +401,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
             Zombie z = w.spawn(base, type, zz -> setup(zz, role, target));
             State s = new State();
             s.role = role;
+            s.cave = cave;
             s.target = target.getUniqueId();
             // inventario inicial por papel; o resto ele junta quebrando blocos no caminho
             // comecam sem blocos (vanilla): so colocam o que mineraram no caminho / antes de subir
@@ -1109,10 +1119,29 @@ final class SmartHorde implements org.bukkit.event.Listener {
     /** Blocos que a horda colocou (rampa, pilar, degrau, ponte, escada): ninguem da horda desmonta. */
     static final java.util.Set<Block> ZPLACED = new java.util.HashSet<>();
 
+    /**
+     * Blocos NATURAIS de caverna. No subsolo o minerador so cava estes: abre tunel ate o jogador,
+     * mas uma base feita com blocos de construcao (pedregulho, tijolo, madeira, vidro, pedra lapidada)
+     * continua segura. Minerios ficam de fora.
+     */
+    static final Set<Material> CAVE_BLOCKS = Set.of(
+            Material.STONE, Material.DEEPSLATE, Material.TUFF, Material.ANDESITE, Material.DIORITE, Material.GRANITE,
+            Material.CALCITE, Material.DRIPSTONE_BLOCK, Material.POINTED_DRIPSTONE, Material.SMOOTH_BASALT,
+            Material.DIRT, Material.GRAVEL, Material.CLAY, Material.MOSS_BLOCK, Material.ROOTED_DIRT, Material.SCULK,
+            Material.NETHERRACK, Material.BLACKSTONE, Material.BASALT);
+
+    /** No subsolo: sem ceu em cima e abaixo do terreno. */
+    static boolean underground(Location l) {
+        Block b = l.getBlock();
+        return b.getLightFromSky() == 0 && l.getBlockY() < l.getWorld().getHighestBlockYAt(l) - 4;
+    }
+
     private static boolean canBreak(State s, Block b) {
         Material m = b.getType();
         if (b.isPassable() || PROTECTED.contains(m) || Tag.BEDS.isTagged(m) || m.getHardness() < 0) return false;
         if (ZPLACED.contains(b)) return false; // nao desmonta a propria estrutura (derrubava quem estava em cima)
+        // CAVERNA: so blocos naturais (a base do jogador no subsolo fica segura)
+        if (s.cave) return CAVE_BLOCKS.contains(m);
         if (Tag.LEAVES.isTagged(m) && s.role != BRUTE && s.role != TANK) return true; // folha sai na mao (vanilla): travava a rampa
         return switch (s.role) {
             case MINER -> Tag.MINEABLE_PICKAXE.isTagged(m) && !Tag.NEEDS_STONE_TOOL.isTagged(m)
