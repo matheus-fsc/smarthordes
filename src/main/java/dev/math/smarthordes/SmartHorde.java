@@ -648,6 +648,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         if (e == null || e.isDead() || !e.isValid() || e.getWorld() != z.getWorld()) return false;
         if (!(e instanceof Player p)) return EXTRA_TARGETS.contains(e.getUniqueId());
         return p.isOnline() && (p.getGameMode() == GameMode.SURVIVAL || p.getGameMode() == GameMode.ADVENTURE)
+                && !ALLY_PLAYERS.contains(p.getUniqueId())
                 && !p.getName().matches("^(Zumbi|Pirata|Guilda)_\\d{1,2}$");
     }
 
@@ -1174,6 +1175,18 @@ final class SmartHorde implements org.bukkit.event.Listener {
         Block b = l.getBlock();
         return b.getLightFromSky() == 0 && l.getBlockY() < l.getWorld().getHighestBlockYAt(l) - 4;
     }
+
+    /** Jogadores jogando COMO zumbi da horda (arena: demonstracao gravada). A horda nao ataca eles. */
+    static final java.util.Set<UUID> ALLY_PLAYERS = new java.util.HashSet<>();
+
+    /** As mesmas regras de quebra do papel (para o jogador-zumbi da arena). */
+    static boolean roleCanBreak(int role, Block b) {
+        State st = new State();
+        st.role = role;
+        return canBreak(st, b) || (role == LUMBER && Tag.LOGS.isTagged(b.getType()));
+    }
+
+    static int capacityOf(org.bukkit.plugin.Plugin pl) { return Math.max(0, pl.getConfig().getInt("horde.block-capacity", 32)); }
 
     private static boolean canBreak(State s, Block b) {
         Material m = b.getType();

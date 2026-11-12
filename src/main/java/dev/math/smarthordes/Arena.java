@@ -125,7 +125,7 @@ final class Arena implements Listener {
 
     void command(CommandSender sender, String[] args) {
         try {
-            if (args.length == 0) { sender.sendMessage("/arena params k=v .. | run <onda> <estrategia> [seg] [tag] | stop | watch on|off"); return; }
+            if (args.length == 0) { sender.sendMessage("/arena params k=v .. | run <onda> <estrategia> [seg] [tag] | stop | watch on|off | zumbi [minerador|lenhador|cavador|guerreiro|sair]"); return; }
             switch (args[0]) {
                 case "params" -> {
                     setParams(args, 1);
@@ -153,6 +153,7 @@ final class Arena implements Listener {
                     });
                 }
                 case "stop" -> { for (Round r : new ArrayList<>(rounds.values())) finish(r, "parado"); }
+                case "zumbi" -> humanZombie(sender, args);
                 case "watch" -> {
                     watch = args.length < 2 || args[1].equalsIgnoreCase("on");
                     if (watch && sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint stop"); sprinting = false; }
@@ -304,7 +305,7 @@ final class Arena implements Listener {
         byDummy.put(r.dummy.getUniqueId(), r);
         if (!watch && !sprinting) { Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "tick sprint 20000000"); sprinting = true; }
         if (task == null) task = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 1L, 1L);
-        for (org.bukkit.entity.Player pl : Bukkit.getOnlinePlayers()) if (rounds.size() == 1) watchPlayer(pl);
+        for (org.bukkit.entity.Player pl : Bukkit.getOnlinePlayers()) if (rounds.size() == 1 && !humanZombies.containsKey(pl.getUniqueId())) watchPlayer(pl);
         plugin.getLogger().info("ARENA_START " + name + " " + strat + " " + secs + "s slot " + slot + " (" + spots.size() + " zumbis) " + tg);
     }
 
@@ -426,13 +427,93 @@ final class Arena implements Listener {
         Round r = byDummy.get(e.getEntity().getUniqueId());
         if (r == null) return;
         e.setCancelled(true); // a vida do substituto e nossa (com armadura), nao a do aldeao
-        if (!(e instanceof EntityDamageByEntityEvent by) || !(by.getDamager() instanceof Zombie)) return;
+        if (!(e instanceof EntityDamageByEntityEvent by)) return;
+        boolean human = by.getDamager() instanceof org.bukkit.entity.Player hp && humanZombies.containsKey(hp.getUniqueId());
+        if (!(by.getDamager() instanceof Zombie) && !human) return;
         double d = e.getDamage() * (1 - ARMOR);
         HP.merge(r.dummy.getUniqueId(), -d, Double::sum);
         r.dmg += d;
         r.hits++;
         r.lastHurt = Bukkit.getCurrentTick() - r.startTick;
         if (r.firstHit < 0) r.firstHit = r.lastHurt;
+    }
+
+    // ------------------------------------------------------------------ jogador como zumbi (demonstracao)
+
+    /** Jogador -> papel (0 minerador, 1 lenhador, 2 brutamontes, 4 cavador). Mesmas regras de quebra e de inventario. */
+    private final Map<UUID, Integer> humanZombies = new HashMap<>();
+
+    /** /arena zumbi [minerador|lenhador|cavador|guerreiro|sair] */
+    private void humanZombie(CommandSender sender, String[] args) {
+        if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("so jogador"); return; }
+        String which = args.length > 1 ? args[1].toLowerCase(java.util.Locale.ROOT) : "minerador";
+        if (which.equals("sair")) {
+            humanZombies.remove(p.getUniqueId());
+            SmartHorde.ALLY_PLAYERS.remove(p.getUniqueId());
+            p.setInvulnerable(false);
+            p.getInventory().clear();
+            watchPlayer(p);
+            p.sendMessage("Voce saiu da horda.");
+            return;
+        }
+        int role = switch (which) {
+            case "lenhador" -> SmartHorde.LUMBER;
+            case "cavador" -> SmartHorde.DIGGER;
+            case "guerreiro" -> SmartHorde.BRUTE;
+            default -> SmartHorde.MINER;
+        };
+        Round r = rounds.values().stream().findFirst().orElse(null);
+        if (r == null) { p.sendMessage("Nenhuma rodada rodando. Comece uma com /arena run <onda> replay 600 demo"); return; }
+        Location at = null;
+        for (UUID id : r.zombies) { Entity e = Bukkit.getEntity(id); if (e != null && !e.isDead()) { at = e.getLocation(); break; } }
+        if (at == null) at = r.dummy.getLocation().add(15, 0, 0);
+        humanZombies.put(p.getUniqueId(), role);
+        SmartHorde.ALLY_PLAYERS.add(p.getUniqueId());
+        p.getInventory().clear();
+        p.getInventory().addItem(new org.bukkit.inventory.ItemStack(switch (role) {
+            case SmartHorde.LUMBER -> Material.WOODEN_AXE;
+            case SmartHorde.DIGGER -> Material.WOODEN_SHOVEL;
+            case SmartHorde.BRUTE -> Material.STONE_SWORD;
+            default -> Material.WOODEN_PICKAXE;
+        }));
+        p.setGameMode(org.bukkit.GameMode.SURVIVAL);
+        p.setFlying(false);
+        p.setAllowFlight(false);
+        p.setInvulnerable(true); // golem e torre nao te matam: o foco e o caminho ate o alvo
+        p.setFoodLevel(20);
+        p.teleport(at);
+        p.sendMessage("Voce e um zumbi da horda (" + which + "). Mesmas regras: so quebra o que o papel quebra, carrega ate "
+                + SmartHorde.capacityOf(plugin) + " blocos e a horda nao te ataca. Chegue no alvo e bata nele. /arena zumbi sair para sair.");
+        plugin.getLogger().info("DEMO " + p.getName() + " jogando como " + which + " na rodada " + r.tag);
+    }
+
+    private int blockCount(org.bukkit.entity.Player p) {
+        int n = 0;
+        for (org.bukkit.inventory.ItemStack it : p.getInventory().getContents())
+            if (it != null && it.getType().isBlock() && it.getType().isSolid()) n += it.getAmount();
+        return n;
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onHumanBreak(org.bukkit.event.block.BlockBreakEvent e) {
+        Integer role = humanZombies.get(e.getPlayer().getUniqueId());
+        if (role == null) return;
+        if (!SmartHorde.roleCanBreak(role, e.getBlock())) {
+            e.setCancelled(true);
+            e.getPlayer().sendActionBar(net.kyori.adventure.text.Component.text("Esse papel nao quebra " + e.getBlock().getType().name().toLowerCase()));
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onHumanPlace(org.bukkit.event.block.BlockPlaceEvent e) {
+        if (humanZombies.containsKey(e.getPlayer().getUniqueId())) SmartHorde.ZPLACED.add(e.getBlockPlaced()); // vira estrutura da horda
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onHumanPickup(org.bukkit.event.entity.EntityPickupItemEvent e) {
+        if (!(e.getEntity() instanceof org.bukkit.entity.Player p) || !humanZombies.containsKey(p.getUniqueId())) return;
+        Material m = e.getItem().getItemStack().getType();
+        if (m.isBlock() && m.isSolid() && blockCount(p) >= SmartHorde.capacityOf(plugin)) e.setCancelled(true);
     }
 
     @EventHandler
