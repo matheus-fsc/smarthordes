@@ -177,6 +177,7 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
         plugin.getConfig().addDefault("horde.drowned", true);
+        plugin.getConfig().addDefault("horde.drowned-leader", true);
         plugin.getConfig().addDefault("horde.no-self-push", true);
         plugin.getConfig().addDefault("horde.ramp-wide-floating", true);
         plugin.getConfig().addDefault("horde.ramp-shapes", "straight,zigzag,spiral");
@@ -657,7 +658,10 @@ final class SmartHorde implements org.bukkit.event.Listener {
                 && !p.getName().matches("^(Zumbi|Pirata|Guilda)_\\d{1,2}$");
     }
 
+    private int tickCount;
+
     private void tick() {
+        if (++tickCount % 4 == 0 && opt("drowned-leader")) drownedLeaders(); // a cada 2 s
         Iterator<Map.Entry<UUID, State>> it = horde.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<UUID, State> en = it.next();
@@ -2080,6 +2084,49 @@ final class SmartHorde implements org.bukkit.event.Listener {
         else z.getPathfinder().stopPathfinding();
         s.action = "esperando o tunel do minerador";
         return true;
+    }
+
+    // ---------------------------------------------------------------- afogado lider
+
+    /** Alvo -> afogado lider da horda daquele alvo. */
+    private final Map<UUID, UUID> drownedLeader = new HashMap<>();
+
+    /**
+     * Cada horda com afogados ganha um AFOGADO LIDER (o de mais vida): brilha, tem nome e tridente. A cada 2 s, todo
+     * afogado num raio em volta dele ganha Graca do Golfinho e Velocidade (so mobs, nunca jogador): a agua fica perigosa.
+     * Se o lider morre, o proximo mais forte assume.
+     */
+    private void drownedLeaders() {
+        Map<UUID, List<org.bukkit.entity.Drowned>> byTarget = new HashMap<>();
+        for (var en : horde.entrySet()) {
+            if (en.getValue().target == null) continue;
+            if (Bukkit.getEntity(en.getKey()) instanceof org.bukkit.entity.Drowned d && !d.isDead())
+                byTarget.computeIfAbsent(en.getValue().target, k -> new ArrayList<>()).add(d);
+        }
+        drownedLeader.keySet().removeIf(t -> !byTarget.containsKey(t));
+        double r = P("leader_radius", 12);
+        for (var en : byTarget.entrySet()) {
+            UUID lid = drownedLeader.get(en.getKey());
+            org.bukkit.entity.Drowned leader = lid != null && Bukkit.getEntity(lid) instanceof org.bukkit.entity.Drowned d && !d.isDead() ? d : null;
+            if (leader == null) {
+                leader = en.getValue().stream().max(java.util.Comparator.comparingDouble(LivingEntity::getHealth)).orElse(null);
+                if (leader == null) continue;
+                drownedLeader.put(en.getKey(), leader.getUniqueId());
+                leader.customName(Component.text("Afogado Lider", net.kyori.adventure.text.format.NamedTextColor.DARK_AQUA));
+                leader.setCustomNameVisible(true);
+                leader.setGlowing(true);
+                EntityEquipment eq = leader.getEquipment();
+                if (eq != null) { eq.setItemInMainHand(new ItemStack(Material.TRIDENT)); eq.setItemInMainHandDropChance(0.05f); }
+                leader.getWorld().playSound(leader.getLocation(), Sound.ENTITY_ELDER_GUARDIAN_CURSE, 0.6f, 1.4f);
+            }
+            Location c = leader.getLocation();
+            c.getWorld().spawnParticle(Particle.BUBBLE_POP, c.clone().add(0, 1, 0), 30, r / 3, 0.5, r / 3, 0.02);
+            for (org.bukkit.entity.Drowned d : c.getWorld().getEntitiesByClass(org.bukkit.entity.Drowned.class)) {
+                if (d.isDead() || d.getLocation().distanceSquared(c) > r * r) continue;
+                d.addPotionEffect(new org.bukkit.potion.PotionEffect(org.bukkit.potion.PotionEffectType.DOLPHINS_GRACE, 60, 0, true, true));
+                d.addPotionEffect(new org.bukkit.potion.PotionEffect(org.bukkit.potion.PotionEffectType.SPEED, 60, 0, true, true));
+            }
+        }
     }
 
     private final Map<UUID, UUID> pioneers = new HashMap<>();

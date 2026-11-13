@@ -54,6 +54,14 @@ final class WaveRecorder implements Listener {
     private final List<String> blocks = new ArrayList<>();
     private BufferedWriter out;
     private int frames;
+    /** Regioes de terreno ja guardadas (x0,y0,z0,sx,sy,sz): a base e os pedacos extras. */
+    private final java.util.List<int[]> covered = new java.util.ArrayList<>();
+    /** Pedacos extras: quem chega perto da borda do que ja foi guardado ganha mais terreno em volta. */
+    private java.io.DataOutputStream patches;
+    private int patchCount;
+    private String faction;
+    private Location center;
+    static final int PATCH_HALF = 24, PATCH_UP = 24, PATCH_DOWN = 24, EDGE = 6, MAX_PATCHES = 300;
 
     WaveRecorder(SmartHordes plugin, World w, Location center, String faction, int lowestY) {
         this.plugin = plugin;
@@ -68,8 +76,13 @@ final class WaveRecorder implements Listener {
         sy = y1 - y0;
         dir = new File(plugin.getDataFolder(), "waves/" + new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date()));
         dir.mkdirs();
+        this.faction = faction;
+        this.center = center.clone();
+        covered.add(new int[]{x0, y0, z0, sx, sy, sz});
         try {
             writeTerrain();
+            patches = new java.io.DataOutputStream(new java.io.BufferedOutputStream(new GZIPOutputStream(
+                    new FileOutputStream(new File(dir, "patches.bin.gz")))));
             out = new BufferedWriter(new OutputStreamWriter(new GZIPOutputStream(
                     new FileOutputStream(new File(dir, "frames.jsonl.gz")), true), StandardCharsets.UTF_8));
             writeMeta(faction, center);
@@ -163,8 +176,58 @@ final class WaveRecorder implements Listener {
 
     // ---------------------------------------------------------------- frames
     /** zs: id, papel, x, y, z, vida, inventario, coletando, acao */
+    /** Ponto dentro de alguma regiao guardada, com folga de EDGE blocos ate a borda? */
+    private boolean inside(Location l) {
+        int x = l.getBlockX(), y = l.getBlockY(), z = l.getBlockZ();
+        for (int[] r : covered) {
+            if (x >= r[0] + EDGE && x < r[0] + r[3] - EDGE && z >= r[2] + EDGE && z < r[2] + r[5] - EDGE
+                    && y >= r[1] + EDGE && y < r[1] + r[4] - EDGE) return true;
+        }
+        return false;
+    }
+
+    /** Guarda mais um pedaco de terreno em volta de l (alinhado a chunk). Formato: 6 ints + bytes na ordem x, z, y. */
+    private void capturePatch(Location l) {
+        if (patches == null || patchCount >= MAX_PATCHES) return;
+        int px0 = ((l.getBlockX() >> 4) << 4) - PATCH_HALF + 8, pz0 = ((l.getBlockZ() >> 4) << 4) - PATCH_HALF + 8;
+        int py0 = Math.max(world.getMinHeight(), l.getBlockY() - PATCH_DOWN);
+        int py1 = Math.min(world.getMaxHeight(), l.getBlockY() + PATCH_UP);
+        int psx = PATCH_HALF * 2, psz = PATCH_HALF * 2, psy = py1 - py0;
+        if (psy <= 0) return;
+        byte[] data = new byte[psx * psz * psy];
+        Map<Long, ChunkSnapshot> snaps = new LinkedHashMap<>();
+        for (int x = 0; x < psx; x++) {
+            for (int z = 0; z < psz; z++) {
+                int wx = px0 + x, wz = pz0 + z;
+                if (!world.isChunkLoaded(wx >> 4, wz >> 4)) continue; // chunk descarregado: fica ar (raro: tem gente perto)
+                long key = (((long) (wx >> 4)) << 32) ^ ((wz >> 4) & 0xffffffffL);
+                ChunkSnapshot cs = snaps.computeIfAbsent(key, k -> world.getChunkAt(wx >> 4, wz >> 4).getChunkSnapshot(false, false, false));
+                for (int y = 0; y < psy; y++) data[(x * psz + z) * psy + y] = (byte) Math.min(255, pal(cs.getBlockType(wx & 15, py0 + y, wz & 15)));
+            }
+        }
+        try {
+            for (int v : new int[]{px0, py0, pz0, psx, psy, psz}) patches.writeInt(v);
+            patches.write(data);
+            patches.flush();
+        } catch (IOException e) {
+            plugin.getLogger().warning("gravador (pedaco extra): " + e.getMessage());
+            return;
+        }
+        covered.add(new int[]{px0, py0, pz0, psx, psy, psz});
+        patchCount++;
+    }
+
     <S> void frame(Map<java.util.UUID, S> horde, Function<S, Object[]> info) {
         if (out == null) return;
+        // terreno dinamico: quem chegou perto da borda do que ja foi guardado ganha mais um pedaco em volta
+        for (Player p : world.getPlayers()) {
+            if (p.getGameMode() == GameMode.SPECTATOR || p.getGameMode() == GameMode.CREATIVE) continue;
+            if (!inside(p.getLocation())) capturePatch(p.getLocation());
+        }
+        for (java.util.UUID id : horde.keySet()) {
+            Entity e = Bukkit.getEntity(id);
+            if (e != null && e.getWorld() == world && !inside(e.getLocation())) capturePatch(e.getLocation());
+        }
         StringBuilder sb = new StringBuilder(256);
         sb.append("{\"t\":").append(SmartHorde.now() - start).append(",\"z\":[");
         boolean first = true;
@@ -221,8 +284,11 @@ final class WaveRecorder implements Listener {
         HandlerList.unregisterAll(this);
         try {
             if (out != null) out.close();
+            if (patches != null) patches.close();
+            writeMeta(faction, center); // a paleta pode ter crescido com os pedacos extras
         } catch (IOException ignored) {
         }
+        patches = null;
         out = null;
         plugin.getLogger().info("Onda gravada: " + dir.getName() + " (" + frames + " frames)");
     }

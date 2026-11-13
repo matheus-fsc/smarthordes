@@ -43,6 +43,7 @@ horde:
   cave-miners: true         # alvo no subsolo: horda so de mineradores que cavam blocos naturais da caverna
                             # (base de pedregulho, tijolo, madeira, vidro ou pedra lapidada fica segura)
   drowned: true             # alguns viram afogados da horda na agua: nadam rapido e alcancam quem esta nela
+  drowned-leader: true      # afogado lider: brilha, tridente, e da Graca do Golfinho + Velocidade aos afogados em volta (so mobs)
   p:
     pillar_max_dy: 4        # pilar individual so ate esta altura; acima, rampa coletiva
     pioneer_max_dy: 6       # pioneiro so age ate esta altura

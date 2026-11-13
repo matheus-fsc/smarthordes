@@ -124,7 +124,7 @@ public final class Invasion implements Listener {
                     t.getWorld().spawnParticle(org.bukkit.Particle.DUST, l.clone().add(0, 1, 0), 30, 0.3, 0.3, 0.3, 0,
                             new org.bukkit.Particle.DustOptions(Color.RED, 2f));
                     t.getWorld().playSound(l, Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1f, 0.7f);
-                    t.sendActionBar(Component.text("☣ A horda sentiu seu cheiro...", NamedTextColor.RED));
+                    subtitle(t, Component.text("☣ A horda sentiu seu cheiro...", NamedTextColor.RED)); // titulo: a barra de acao e do DirectionHUD
                 }
             }
         }, 20L, 20L);
@@ -170,7 +170,9 @@ public final class Invasion implements Listener {
     public void onBed(org.bukkit.event.player.PlayerBedEnterEvent e) {
         if (pending == null && active != Faction.ZUMBIS) return;
         e.setCancelled(true);
-        e.getPlayer().sendActionBar(Component.text("Voce nao consegue dormir com a horda chegando.", NamedTextColor.RED));
+        Component bed = Component.text("Voce nao consegue dormir com a horda chegando.", NamedTextColor.RED);
+        subtitle(e.getPlayer(), bed);
+        e.getPlayer().sendMessage(bed);
     }
 
     public Invasion(SmartHordes plugin) {
@@ -700,5 +702,11 @@ public final class Invasion implements Listener {
             out.complete(spots.isEmpty() ? null : spots);
         }));
         return out;
+    }
+
+    /** Aviso no meio da tela (subtitulo). A barra de acao fica livre para HUDs como o DirectionHUD. */
+    private static void subtitle(org.bukkit.entity.Player p, Component msg) {
+        p.showTitle(net.kyori.adventure.title.Title.title(Component.empty(), msg,
+                net.kyori.adventure.title.Title.Times.times(java.time.Duration.ofMillis(150), java.time.Duration.ofMillis(2200), java.time.Duration.ofMillis(400))));
     }
 }

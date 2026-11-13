@@ -70,6 +70,9 @@ final class Arena implements Listener {
     private boolean sprinting, watch;
 
     /** Uma rodada (um slot). */
+    /** Pedacos extras colados em cada slot (para limpar quando outra onda usar o slot). */
+    private final Map<Integer, List<int[]>> slotExtras = new HashMap<>();
+
     private final class Round {
         int slot;
         Villager dummy;
@@ -205,6 +208,29 @@ final class Arena implements Listener {
         byte[] data;
         try (GZIPInputStream in = new GZIPInputStream(new FileInputStream(new File(dir, "terrain.bin.gz")))) { data = in.readAllBytes(); }
         int[] oldBox = boxes[slot];
+        // pedacos extras da gravacao (terreno guardado conforme jogadores e zumbis andaram)
+        List<int[]> extraBoxes = new ArrayList<>();
+        List<byte[]> extraData = new ArrayList<>();
+        File pf = new File(dir, "patches.bin.gz");
+        int pdx = x0 - o.get(0).getAsInt(), pdz = z0 - o.get(2).getAsInt();
+        if (pf.isFile()) {
+            try (java.io.DataInputStream pin = new java.io.DataInputStream(new java.io.BufferedInputStream(new GZIPInputStream(new FileInputStream(pf))))) {
+                while (true) {
+                    int px, py, pz, psx, psy, psz;
+                    try { px = pin.readInt(); } catch (java.io.EOFException eof) { break; }
+                    py = pin.readInt(); pz = pin.readInt(); psx = pin.readInt(); psy = pin.readInt(); psz = pin.readInt();
+                    byte[] pd = new byte[psx * psy * psz];
+                    pin.readFully(pd);
+                    extraBoxes.add(new int[]{px + pdx, py, pz + pdz, psx, psy, psz});
+                    extraData.add(pd);
+                }
+            } catch (java.io.IOException cut) { /* gravacao cortada no meio: usa os pedacos inteiros */ }
+        }
+        List<int[]> oldExtras = slotExtras.getOrDefault(slot, List.of());
+        slotExtras.put(slot, extraBoxes);
+        for (int[] eb : extraBoxes)
+            for (int cx = (eb[0] >> 4) - 1; cx <= ((eb[0] + eb[3]) >> 4) + 1; cx++)
+                for (int cz = (eb[2] >> 4) - 1; cz <= ((eb[2] + eb[5]) >> 4) + 1; cz++) world.setChunkForceLoaded(cx, cz, true);
         int[] box = new int[]{x0, y0, z0, sx, sy, szz};
         boxes[slot] = box;
         for (int cx = (x0 >> 4) - 1; cx <= ((x0 + sx) >> 4) + 1; cx++)
@@ -212,7 +238,7 @@ final class Arena implements Listener {
         final byte[] d = data;
         final int total = sx * szz * sy;
         new org.bukkit.scheduler.BukkitRunnable() {
-            int i = 0, clearI = 0;
+            int i = 0, clearI = 0, oldExtraI = 0, oldExtraK = 0, extraI = 0, extraK = 0;
             final int clearTotal = oldBox == null || java.util.Arrays.equals(oldBox, box) ? 0 : oldBox[3] * oldBox[4] * oldBox[5];
             @Override public void run() {
                 int budget = 60_000;
@@ -228,7 +254,32 @@ final class Arena implements Listener {
                     Block b = world.getBlockAt(x0 + x, y0 + y, z0 + z);
                     if (b.getType() != m) b.setType(m, false);
                 }
-                if (i >= total && clearI >= clearTotal) {
+                while (oldExtraI < oldExtras.size() && budget > 0) { // limpa os pedacos extras da onda anterior
+                    int[] eb = oldExtras.get(oldExtraI);
+                    int n = eb[3] * eb[4] * eb[5];
+                    while (oldExtraK < n && budget-- > 0) {
+                        int k = oldExtraK++;
+                        int y = k % eb[4], z = (k / eb[4]) % eb[5], x = k / (eb[4] * eb[5]);
+                        world.getBlockAt(eb[0] + x, eb[1] + y, eb[2] + z).setType(Material.AIR, false);
+                    }
+                    if (oldExtraK >= n) { oldExtraI++; oldExtraK = 0; }
+                }
+                while (i >= total && clearI >= clearTotal && oldExtraI >= oldExtras.size() && extraI < extraBoxes.size() && budget > 0) {
+                    int[] eb = extraBoxes.get(extraI);
+                    byte[] pd = extraData.get(extraI);
+                    int n = eb[3] * eb[4] * eb[5];
+                    while (extraK < n && budget-- > 0) {
+                        int k = extraK++;
+                        int y = k % eb[4], z = (k / eb[4]) % eb[5], x = k / (eb[4] * eb[5]);
+                        int idx = pd[k] & 0xff;
+                        Material m = idx < mats.length ? mats[idx] : Material.STONE;
+                        if (m.isAir()) continue; // ar do pedaco nao apaga o que a base ja colocou
+                        Block b = world.getBlockAt(eb[0] + x, eb[1] + y, eb[2] + z);
+                        if (b.getType() != m) b.setType(m, false);
+                    }
+                    if (extraK >= n) { extraI++; extraK = 0; }
+                }
+                if (i >= total && clearI >= clearTotal && oldExtraI >= oldExtras.size() && extraI >= extraBoxes.size()) {
                     cancel();
                     // so os blocos de horda deste slot saem da lista (os outros slots seguem rodando)
                     SmartHorde.ZPLACED.removeIf(b -> b.getWorld() == world && b.getX() >= x0 - 50 && b.getX() < x0 + SLOT_SPACING - 50);
