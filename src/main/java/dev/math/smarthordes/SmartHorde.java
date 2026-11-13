@@ -1186,9 +1186,13 @@ final class SmartHorde implements org.bukkit.event.Listener {
             Material.NETHERRACK, Material.BLACKSTONE, Material.BASALT);
 
     /** No subsolo: sem ceu em cima e abaixo do terreno. */
+    /**
+     * No subsolo: bem abaixo do chao real (altura do terreno SEM folhas). Antes usava a falta de luz do ceu, e embaixo
+     * de arvore fechada ou de telhado tambem nao ha luz do ceu: guerreiros na superficie esperavam um "tunel".
+     */
     static boolean underground(Location l) {
-        Block b = l.getBlock();
-        return b.getLightFromSky() == 0 && l.getBlockY() < l.getWorld().getHighestBlockYAt(l) - 4;
+        int surface = l.getWorld().getHighestBlockYAt(l.getBlockX(), l.getBlockZ(), org.bukkit.HeightMap.MOTION_BLOCKING_NO_LEAVES);
+        return l.getBlockY() < surface - 5;
     }
 
     /** Jogadores jogando COMO zumbi da horda (arena: demonstracao gravada). A horda nao ataca eles. */
