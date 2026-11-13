@@ -58,6 +58,9 @@ final class SmartHorde implements org.bukkit.event.Listener {
         int tick;
         /** Na agua: para onde nadar (margem ou o proprio alvo); null fora da agua. */
         Location swimTo;
+        /** Subsolo: ponto da caverna ligada ao alvo para onde esta cavando (recalcula a cada 2 s). */
+        Location caveGoal;
+        long caveGoalAt;
         /** Ate quando prefere cavar escada no morro em vez de rampa (reavalia a cada 8 s). */
         long digUntil;
         /** Golem que bateu nele (guerreiro revida por alguns segundos) e torre que ele foi quebrar. */
@@ -168,6 +171,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         plugin.getConfig().addDefault("horde.fight-golems", true);
         plugin.getConfig().addDefault("horde.clear-leaves", true);
         plugin.getConfig().addDefault("horde.prefer-dig-stairs", true);
+        plugin.getConfig().addDefault("horde.cave-route", true);
+        plugin.getConfig().addDefault("horde.warriors-wait-tunnel", true);
         plugin.getConfig().addDefault("horde.break-turrets", true);
         plugin.getConfig().addDefault("horde.fell-whole-tree", true);
         plugin.getConfig().addDefault("horde.tidy-gather", true);
@@ -787,7 +792,12 @@ final class SmartHorde implements org.bukkit.event.Listener {
             if (zl.getBlock().getType() == Material.LADDER && tl.getY() - zl.getY() >= 1) { act(z, s, zl, tl, dist); continue; }
             if (s.stuckTicks < Pi("stuck_ticks", 3) && s.pathOk) continue; // andando normalmente
 
-            act(z, s, zl, tl, dist);
+            Location goal = tl;
+            if (opt("cave-route") && tool(s) != null && (underground(tl) || underground(zl))) {
+                Location entry = caveEntry(z, s, t);
+                if (entry != null) { goal = entry; s.action = "cavando ate a caverna livre"; }
+            }
+            act(z, s, zl, goal, dist);
         }
         if (REC != null) REC.frame(horde, s -> new Object[]{s.role, s.invTotal, s.gathering ? 1 : 0, s.action});
         if (horde.isEmpty() && task != null) { task.cancel(); task = null; if (!KEEP_REC) stopRecording(); }
@@ -966,7 +976,8 @@ final class SmartHorde implements org.bukkit.event.Listener {
         if (dy >= 1 && climbLadder(z, s, zl, feet, dir)) return;
         if (s.role == LUMBER && dy >= 2 && horiz < P("ladder_max_horiz", 6) && buildLadder(z, s, feet, dir, dy)) return;
 
-        // brutamontes/tanque nao mexem em blocos: so tentam destravar e seguem os outros
+        // brutamontes/tanque nao mexem em blocos: no subsolo esperam atras do minerador (nao entopem o tunel)
+        if (tool(s) == null && opt("warriors-wait-tunnel") && underground(zl) && followMiner(z, s)) return;
         if (tool(s) == null) {
             safeNudge(z, dir, 0.22);
             return;
@@ -1974,6 +1985,101 @@ final class SmartHorde implements org.bukkit.event.Listener {
             if (floor.isPassable() || floor.isLiquid()) floorMissing++;
         }
         return floorMissing <= 1 && solid >= dy; // morro de verdade (caminho em boa parte solido) e com chao
+    }
+
+    // ---------------------------------------------------------------- subsolo: rota pelas cavernas
+
+    /** Ar ligado ao alvo (cavernas/tuneis por onde da para andar ate ele): bloco -> passos ate o alvo. Cache de 5 s. */
+    private final Map<UUID, Map<Long, Integer>> caveNet = new HashMap<>();
+    private final Map<UUID, Long> caveNetAt = new HashMap<>();
+
+    private static long key(int x, int y, int z) { return ((long) x & 0x3FFFFFF) << 38 | ((long) z & 0x3FFFFFF) << 12 | (y & 0xFFF); }
+
+    private Map<Long, Integer> caveNetwork(LivingEntity t) {
+        long now = now();
+        Long at = caveNetAt.get(t.getUniqueId());
+        if (at != null && now - at < 5000) return caveNet.get(t.getUniqueId());
+        Map<Long, Integer> dist = new HashMap<>();
+        Block start = t.getLocation().getBlock();
+        java.util.ArrayDeque<Block> q = new java.util.ArrayDeque<>();
+        q.add(start);
+        dist.put(key(start.getX(), start.getY(), start.getZ()), 0);
+        int R = (int) P("cave_net_r", 32), max = Pi("cave_net_max", 25000);
+        while (!q.isEmpty() && dist.size() < max) {
+            Block b = q.poll();
+            int d = dist.get(key(b.getX(), b.getY(), b.getZ()));
+            for (BlockFace f : new BlockFace[]{BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST, BlockFace.UP, BlockFace.DOWN}) {
+                Block n = b.getRelative(f);
+                if (Math.abs(n.getX() - start.getX()) > R || Math.abs(n.getZ() - start.getZ()) > R || Math.abs(n.getY() - start.getY()) > R) continue;
+                long k = key(n.getX(), n.getY(), n.getZ());
+                if (dist.containsKey(k) || !n.isPassable() || n.isLiquid()) continue;
+                if (!n.getWorld().isChunkLoaded(n.getX() >> 4, n.getZ() >> 4)) continue;
+                dist.put(k, d + 1);
+                q.add(n);
+            }
+        }
+        caveNet.put(t.getUniqueId(), dist);
+        caveNetAt.put(t.getUniqueId(), now);
+        return dist;
+    }
+
+    /**
+     * Ponto do sistema de cavernas ligado ao alvo mais barato de alcancar cavando: blocos a cavar ate ele
+     * (distancia em linha) + peso x passos que faltam pela caverna. So pontos com chao (da para ficar em pe).
+     * null = o zumbi ja esta dentro da caverna ligada (o pathfinder resolve) ou nao ha caverna util.
+     */
+    private Location caveEntry(Zombie z, State s, LivingEntity t) {
+        Map<Long, Integer> net = caveNetwork(t);
+        Block zb = z.getLocation().getBlock();
+        if (net.containsKey(key(zb.getX(), zb.getY(), zb.getZ()))) return null;
+        if (s.caveGoal != null && now() - s.caveGoalAt < 2000 && s.caveGoal.getWorld() == z.getWorld()) return s.caveGoal;
+        double walkW = P("cave_walk_weight", 0.35);
+        double direct = z.getLocation().distance(t.getLocation());
+        double best = direct * 1.0; // cavar reto ate o alvo e a referencia
+        Location goal = null;
+        World w = z.getWorld();
+        for (var en : net.entrySet()) {
+            long k = en.getKey();
+            int y = (int) (k & 0xFFF);
+            if (y >= 2048) y -= 4096;
+            int x = (int) (k >> 38), zz = (int) ((k >> 12) & 0x3FFFFFF);
+            if (x >= (1 << 25)) x -= 1 << 26;
+            if (zz >= (1 << 25)) zz -= 1 << 26;
+            double dig = Math.abs(x - zb.getX()) + Math.abs(y - zb.getY()) * 1.3 + Math.abs(zz - zb.getZ());
+            if (dig > best) continue;
+            double cost = dig + walkW * en.getValue();
+            if (cost >= best) continue;
+            Block floor = w.getBlockAt(x, y - 1, zz);
+            if (!floor.getType().isSolid()) continue;
+            best = cost;
+            goal = new Location(w, x + 0.5, y, zz + 0.5);
+        }
+        s.caveGoal = goal;
+        s.caveGoalAt = now();
+        return goal;
+    }
+
+    /** Guerreiro no subsolo: fica 3 blocos atras do minerador mais perto (mesmo alvo) ate o tunel abrir. */
+    private boolean followMiner(Zombie z, State s) {
+        Zombie best = null;
+        double bd = 144;
+        for (var en : horde.entrySet()) {
+            State o = en.getValue();
+            if (o == s || tool(o) == null || o.target == null || !o.target.equals(s.target)) continue;
+            Entity e = Bukkit.getEntity(en.getKey());
+            if (!(e instanceof Zombie m) || m.getWorld() != z.getWorld()) continue;
+            double d = m.getLocation().distanceSquared(z.getLocation());
+            if (d < bd) { bd = d; best = m; }
+        }
+        if (best == null) return false;
+        Location ml = best.getLocation();
+        Vector back = z.getLocation().toVector().subtract(ml.toVector()).setY(0);
+        if (back.lengthSquared() < 0.01) back = new Vector(1, 0, 0);
+        Location spot = ml.clone().add(back.normalize().multiply(3));
+        if (z.getLocation().distanceSquared(spot) > 2) z.getPathfinder().moveTo(spot, 1.0);
+        else z.getPathfinder().stopPathfinding();
+        s.action = "esperando o tunel do minerador";
+        return true;
     }
 
     private final Map<UUID, UUID> pioneers = new HashMap<>();
